@@ -26,10 +26,10 @@ class DataBaseSampler(object):
         for class_name in class_names:
             self.db_infos[class_name] = []
 
-        self.use_shared_memory = sampler_cfg.get('USE_SHARED_MEMORY', False)
-
+        self.use_shared_memory = sampler_cfg.get('USE_SHARED_MEMORY', False)        
         for db_info_path in sampler_cfg.DB_INFO_PATH:
             db_info_path = self.root_path.resolve() / db_info_path
+            print()
             if not db_info_path.exists():
                 assert len(sampler_cfg.DB_INFO_PATH) == 1
                 sampler_cfg.DB_INFO_PATH[0] = sampler_cfg.BACKUP_DB_INFO['DB_INFO_PATH']

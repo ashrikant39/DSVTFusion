@@ -15,3 +15,10 @@ venv/
 *.bin
 output
 version.py
+scripts
+experiments
+work_dirs
+*.txt
+job_logs
+saved_preds
+*.ply

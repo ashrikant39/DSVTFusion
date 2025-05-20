@@ -44,7 +44,7 @@ class BasicBlock(nn.Module):
         if self.downsample:
             identity = self.downsample_layer(x)
 
-        out += identity
+        out += identity # TODO: CHANGED
         out = self.relu2(out)
 
         return out

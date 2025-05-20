@@ -225,7 +225,6 @@ class MultiHeadedAttention(nn.Module):
 
     def forward(self, query, key, value):
         batch_dim = query.size(0)
-        # pdb.set_trace()
         query, key, value = [l(x).view(batch_dim, self.dim, self.num_heads, -1)
                              for l, x in zip(self.proj, (query, key, value))]
         x, prob = attention(query, key, value)

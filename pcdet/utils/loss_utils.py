@@ -340,7 +340,6 @@ def _reg_loss(regr, gt_regr, mask):
 
     # loss = loss / (num + 1e-4)
     loss = loss / torch.clamp_min(num, min=1.0)
-    # import pdb; pdb.set_trace()
     return loss
 
 

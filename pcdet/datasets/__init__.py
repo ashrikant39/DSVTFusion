@@ -7,7 +7,7 @@ from pcdet.utils import common_utils
 
 from .dataset import DatasetTemplate
 from .kitti.kitti_dataset import KittiDataset
-from .nuscenes.nuscenes_dataset import NuScenesDataset
+from .nuscenes.nuscenes_dataset import NuScenesDataset, NuScenesTemporalDataset
 from .waymo.waymo_dataset import WaymoDataset
 from .pandaset.pandaset_dataset import PandasetDataset
 from .lyft.lyft_dataset import LyftDataset
@@ -20,7 +20,8 @@ __all__ = {
     'WaymoDataset': WaymoDataset,
     'PandasetDataset': PandasetDataset,
     'LyftDataset': LyftDataset,
-    'CustomDataset': CustomDataset
+    'CustomDataset': CustomDataset,
+    'NuScenesTemporalDataset': NuScenesTemporalDataset
 }
 
 
@@ -77,3 +78,5 @@ def build_dataloader(dataset_cfg, class_names, batch_size, dist, root_path=None,
     )
 
     return dataset, dataloader, sampler
+
+# (sampler is None) and training

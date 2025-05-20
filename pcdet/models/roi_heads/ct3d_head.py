@@ -74,7 +74,6 @@ class CT3DHead(RoIHeadTemplate):
             local_roi_grid_points.clone(), rois[:, 6]
         ).squeeze(dim=1)
         global_center = rois[:, 0:3].clone()
-        # pdb.set_trace()
 
         global_roi_grid_points += global_center.unsqueeze(dim=1)
         return global_roi_grid_points, local_roi_grid_points

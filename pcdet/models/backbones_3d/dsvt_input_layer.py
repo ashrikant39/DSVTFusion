@@ -34,35 +34,37 @@ class DSVTInputLayer(nn.Module):
         super().__init__()
         
         self.model_cfg = model_cfg 
-        self.sparse_shape = self.model_cfg.sparse_shape
-        self.window_shape = self.model_cfg.window_shape
-        self.downsample_stride = self.model_cfg.downsample_stride
-        self.d_model = self.model_cfg.d_model
-        self.set_info = self.model_cfg.set_info
+        self.sparse_shape = self.model_cfg.sparse_shape # [360, 360, 1]
+        self.window_shape = self.model_cfg.window_shape # [[30, 30, 1]]
+        self.downsample_stride = self.model_cfg.downsample_stride # []
+        self.d_model = self.model_cfg.d_model # [128]
+        self.set_info = self.model_cfg.set_info # [[90, 4]]
         self.stage_num = len(self.d_model)
 
-        self.hybrid_factor = self.model_cfg.hybrid_factor
+        self.hybrid_factor = self.model_cfg.hybrid_factor # [1, 1, 1]
         self.window_shape = [[self.window_shape[s_id], [self.window_shape[s_id][coord_id] * self.hybrid_factor[coord_id] \
-                                                for coord_id in range(3)]] for s_id in range(self.stage_num)]
-        self.shift_list = self.model_cfg.shifts_list
-        self.normalize_pos = self.model_cfg.normalize_pos
+                                                for coord_id in range(3)]] for s_id in range(self.stage_num)] # [[[30,30,1], [30,30,1]]]
+        self.shift_list = self.model_cfg.shifts_list # [[[0, 0, 0], [15, 15, 0]]]
+        self.normalize_pos = self.model_cfg.normalize_pos # False
             
-        self.num_shifts = [2,] * len(self.window_shape)
+        self.num_shifts = [2,] * len(self.window_shape) # [2, 2, 2]
 
-        self.sparse_shape_list = [self.sparse_shape]
+        self.sparse_shape_list = [self.sparse_shape] # [[360, 360, 1]]
         # compute sparse shapes for each stage
         for ds_stride in self.downsample_stride:
             last_sparse_shape = self.sparse_shape_list[-1]
             self.sparse_shape_list.append((ceil(last_sparse_shape[0]/ds_stride[0]), ceil(last_sparse_shape[1]/ds_stride[1]), ceil(last_sparse_shape[2]/ds_stride[2])))
         
         # position embedding layers
+        # Position Embedding is not global
+        # Because there is no shift-info provided to the pos_embed layer.
         self.posembed_layers = nn.ModuleList()
-        for i in range(len(self.set_info)):
-            input_dim = 3 if self.sparse_shape_list[i][-1] > 1 else 2
+        for i in range(len(self.set_info)): # len(self.set_info) = 1
+            input_dim = 3 if self.sparse_shape_list[i][-1] > 1 else 2 # checking if feature is 2D or 3D
             stage_posembed_layers = nn.ModuleList()
-            for j in range(self.set_info[i][1]):
+            for j in range(self.set_info[i][1]): # j=0,1,2,3
                 block_posembed_layers = nn.ModuleList()
-                for s in range(self.num_shifts[i]):
+                for s in range(self.num_shifts[i]): # s=0,1
                     block_posembed_layers.append(PositionEmbeddingLearned(input_dim, self.d_model[i]))
                 stage_posembed_layers.append(block_posembed_layers)
             self.posembed_layers.append(stage_posembed_layers)
@@ -185,31 +187,38 @@ class DSVTInputLayer(nn.Module):
         return voxel_info
     
     def get_set_single_shift(self, batch_win_inds, stage_id, shift_id=None, coors_in_win=None):
+        """
+        batch_win_inds -> Flat indices of each windows
+        coors_in_win -> Coordinate of each voxel within its window
+        """
         device = batch_win_inds.device
         # the number of voxels assigned to a set
-        voxel_num_set = self.set_info[stage_id][0]
+        voxel_num_set = self.set_info[stage_id][0] # 90 -> tau
         # max number of voxels in a window
         max_voxel = self.window_shape[stage_id][shift_id][0] * self.window_shape[stage_id][shift_id][1] * self.window_shape[stage_id][shift_id][2]
         # get unique set indexs
-        contiguous_win_inds = torch.unique(batch_win_inds, return_inverse=True)[1]
-        voxelnum_per_win = torch.bincount(contiguous_win_inds)
+        contiguous_win_inds = torch.unique(batch_win_inds, return_inverse=True)[1] # get the positions of the i-th unique window index
+        voxelnum_per_win = torch.bincount(contiguous_win_inds) # Get the frequency of the i-th unique window index, or number of voxels in window i -> N
         win_num = voxelnum_per_win.shape[0]
         setnum_per_win_float = voxelnum_per_win / voxel_num_set
-        setnum_per_win = torch.ceil(setnum_per_win_float).long()
+        setnum_per_win = torch.ceil(setnum_per_win_float).long() # Get the number of sets in each window (N/tau)
         set_win_inds, set_inds_in_win = get_continous_inds(setnum_per_win)
+        
+        # set_win_inds -> Window indexs of each set with shape (set_num).
+        # set_inds_in_win -> Set indexs inner window with shape (set_num).
         
         # compution of Eq.3 in 'DSVT: Dynamic Sparse Voxel Transformer with Rotated Sets' - https://arxiv.org/abs/2301.06051, 
         # for each window, we can get voxel indexs belong to different sets.
         offset_idx = set_inds_in_win[:,None].repeat(1, voxel_num_set) * voxel_num_set
         base_idx = torch.arange(0, voxel_num_set, 1, device=device)
-        base_select_idx = offset_idx + base_idx
-        base_select_idx = base_select_idx * voxelnum_per_win[set_win_inds][:,None]
+        base_select_idx = offset_idx + base_idx # window_index_of_the_set * 90 + i where i in [0...89] -> flat index of each set
+        base_select_idx = base_select_idx * voxelnum_per_win[set_win_inds][:,None] # 
         base_select_idx = base_select_idx.double() / (setnum_per_win[set_win_inds] * voxel_num_set)[:,None].double()
         base_select_idx = torch.floor(base_select_idx)
         # obtain unique indexs in whole space
         select_idx = base_select_idx
         select_idx = select_idx + set_win_inds.view(-1, 1) * max_voxel
-           
+        
         # this function will return unordered inner window indexs of each voxel
         inner_voxel_inds = get_inner_win_inds_cuda(contiguous_win_inds)
         global_voxel_inds = contiguous_win_inds * max_voxel + inner_voxel_inds

@@ -127,8 +127,6 @@ class SparseAnchorFreeHead(nn.Module):
         plt.figure()
         plt.imshow(img)
         plt.show(block=False)
-        import pdb
-        pdb.set_trace()
 
     def assign_target_of_single_head(
             self, num_classes, gt_boxes, feature_map_size, feature_map_stride, pixel_coords, num_max_objs=500,

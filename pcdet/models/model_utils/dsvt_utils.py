@@ -16,7 +16,7 @@ class PositionEmbeddingLearned(nn.Module):
         self.position_embedding_head = nn.Sequential(
             nn.Linear(input_channel, num_pos_feats),
             nn.BatchNorm1d(num_pos_feats),
-            nn.ReLU(inplace=True),
+            nn.ReLU(inplace=False), # TODO: Changed
             nn.Linear(num_pos_feats, num_pos_feats))
 
     def forward(self, xyz):
@@ -81,6 +81,10 @@ def get_window_coors(coors, sparse_shape, window_shape, do_shift, shift_list=Non
         batch_win_coords = torch.stack([win_coors_z, win_coors_y, win_coors_x], dim=-1)
         return batch_win_inds, coors_in_win, batch_win_coords
     
+    # batch_win_inds -> Flat indices of each windows
+    # batch_win_coords -> Full index of each window
+    # coors_in_win -> Coordinate of each voxel within its window
+    
     return batch_win_inds, coors_in_win
 
 
@@ -133,10 +137,10 @@ def get_continous_inds(setnum_per_win):
         # we can get: set_inds_in_win = tensor([0, 0, 1, 0, 0, 1, 2])
     '''
     set_num = setnum_per_win.sum().item() # set_num = 7
-    setnum_per_win_cumsum = torch.cumsum(setnum_per_win, dim=0)[:-1] # [1, 3, 4]
+    setnum_per_win_cumsum = torch.cumsum(setnum_per_win, dim=0)[:-1] # [1, 3, 4] # find indices where new set inds start
     set_win_inds = torch.full((set_num,), 0, device=setnum_per_win.device)
     set_win_inds[setnum_per_win_cumsum] = 1 # [0, 1, 0, 1, 1, 0, 0]
-    set_win_inds = torch.cumsum(set_win_inds, dim=0) # [0, 1, 1, 2, 3, 3, 3]
+    set_win_inds = torch.cumsum(set_win_inds, dim=0) # [0, 1, 1, 2, 3, 3, 3]  # window indices of each set
     
     roll_set_win_inds_left = torch.roll(set_win_inds, -1)  # [1, 1, 2, 3, 3, 3, 0]
     diff = set_win_inds - roll_set_win_inds_left # [-1, 0, -1, -1, 0, 0, 3]
@@ -145,6 +149,9 @@ def get_continous_inds(setnum_per_win):
     template[end_pos_mask] = (setnum_per_win - 1) * -1  # [ 0, 1, -1, 0, 1, 1, -2]
     set_inds_in_win = torch.cumsum(template,dim=0) # [0, 1, 0, 0, 1, 2, 0]
     set_inds_in_win[end_pos_mask] = setnum_per_win # [1, 1, 2, 1, 1, 2, 3]
-    set_inds_in_win = set_inds_in_win - 1 # [0, 0, 1, 0, 0, 1, 2]
+    set_inds_in_win = set_inds_in_win - 1 # [0, 0, 1, 0, 0, 1, 2] -> first window : 1 set so 0
+                                          #                          second window: 2 sets, so 0,1
+                                          #                          third window: 1 set, so 0
+                                          #                          fourth window: 3 sets, so 0,1,2 
     
     return set_win_inds, set_inds_in_win

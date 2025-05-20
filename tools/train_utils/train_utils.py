@@ -15,6 +15,74 @@ except:
     # Make sure the torch version is latest enough to support mixed precision training
     pass
 
+# def dtype_hook(module, input, output):
+#     input_dtypes = [inp.dtype for inp in input if torch.is_tensor(inp)]
+#     output_dtypes = output.dtype if torch.is_tensor(output) else [o.dtype for o in output if torch.is_tensor(o)]
+    
+#     with open('/home/ashri/DSVT/floats.txt', 'a') as fp:
+#         print(f"{module.__class__.__name__} | input dtype: {input_dtypes} | output dtype: {output_dtypes}", file=fp)
+
+
+# def memory_hook(module, input, output):
+#     torch.cuda.synchronize()  # ensures all CUDA ops are done
+#     mem_allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # in MB
+#     mem_reserved = torch.cuda.memory_reserved() / (1024 ** 2)    # in MB
+    
+#     with open('/home/ashri/DSVT/memlog_children.txt', 'a') as fp:
+#         print(f"{module.__class__.__name__:<30} | Allocated: {mem_allocated:.2f} MB | Reserved: {mem_reserved:.2f} MB", file=fp)
+
+def nan_hook(module, input, output):
+    with open("/home/ashri/DSVT/work_dirs/isnan_forward_file.txt", 'a') as fp:
+        # Check inputs
+        for i, inp in enumerate(input):
+            if isinstance(inp, torch.Tensor) and torch.isnan(inp).any():
+                print(f"{module.__class__.__name__} input[{i}] has NaNs", file=fp)
+
+        # Check output
+        if isinstance(output, torch.Tensor) and torch.isnan(output).any():
+            print(f"{module.__class__.__name__} output has NaNs", file=fp)
+        elif isinstance(output, (tuple, list)):
+            for i, out in enumerate(output):
+                if isinstance(out, torch.Tensor) and torch.isnan(out).any():
+                    print(f"{module.__class__.__name__} output[{i}] has NaNs", file=fp)
+
+        # Check parameters
+        for name, param in module.named_parameters(recurse=False):  # Only check local params
+            if torch.isnan(param).any():
+                print(f"{module.__class__.__name__} param '{name}' has NaNs", file=fp)
+
+
+def nan_backward_hook(module, grad_input, grad_output):
+    with open("/home/ashri/DSVT/work_dirs/isnan_file_backward.txt", 'a') as fp:
+        for i, g_in in enumerate(grad_input):
+            if isinstance(g_in, torch.Tensor) and torch.isnan(g_in).any():
+                print(f"{module.__class__.__name__} grad_input[{i}] has NaNs", file=fp)
+
+        for i, g_out in enumerate(grad_output):
+            if isinstance(g_out, torch.Tensor) and torch.isnan(g_out).any():
+                print(f"{module.__class__.__name__} grad_output[{i}] has NaNs", file=fp)
+
+        for name, param in module.named_parameters(recurse=False):
+            if param.grad is not None and torch.isnan(param.grad).any():
+                print(f"{module.__class__.__name__} param '{name}' grad has NaNs", file=fp)
+
+
+def grad_hook(module, input, output):
+    def attach_hook(tensor):
+        if tensor.requires_grad:
+            tensor.retain_grad()
+            def log_if_nan(grad):
+                if torch.isnan(grad).any():
+                    with open("/home/ashri/DSVT/work_dirs/isnan_grad.txt", 'a') as f:
+                        f.write(f"{module.__class__.__name__} grad has NaNs: True\n")
+            tensor.register_hook(log_if_nan)
+
+    if isinstance(output, torch.Tensor):
+        attach_hook(output)
+    elif isinstance(output, (tuple, list)):
+        for o in output:
+            if isinstance(o, torch.Tensor):
+                attach_hook(o)
 
 
 def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, accumulated_iter, optim_cfg,
@@ -43,8 +111,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
     amp_ctx = contextlib.nullcontext()
     if fp16:
         scaler = torch.cuda.amp.grad_scaler.GradScaler(init_scale=optim_cfg.get('LOSS_SCALE_FP16', 2.0**16))
-        amp_ctx = torch.cuda.amp.autocast()
-
+        amp_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16)
 
     end = time.time()
     for cur_it in range(start_it, total_it_each_epoch):
@@ -73,6 +140,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
 
         with amp_ctx:
             loss, tb_dict, disp_dict = model_func(model, batch)
+            
             if fp16:
                 assert loss.dtype is torch.float32
                 scaler.scale(loss).backward()
@@ -117,7 +185,7 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
                 disp_dict.update({
                 'loss_rcnn_cls': f'{rcnn_cls_loss_disp.avg:.4f}', 'loss_rcnn_reg': f'{rcnn_reg_loss_disp.avg:.4f}'})
             disp_dict.update({
-                'loss': loss_disp.avg, 'lr': cur_lr, 'd_time': f'{data_time.val:.2f}({data_time.avg:.2f})',
+                'loss': f'{loss_disp.avg:.4f}', 'lr': cur_lr, 'd_time': f'{data_time.val:.2f}({data_time.avg:.2f})',
                 'f_time': f'{forward_time.val:.2f}({forward_time.avg:.2f})', 'b_time': f'{batch_time.val:.2f}({batch_time.avg:.2f})',
                 'norm': total_norm.item()
             })
@@ -180,8 +248,18 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 lr_warmup_scheduler=None, ckpt_save_interval=1, max_ckpt_save_num=50,
                 merge_all_iters_to_one_epoch=False,
                 use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, fp16=False, cfg=None):
-    accumulated_iter = start_iter
+    accumulated_iter = start_iter   
 
+    for module in model.modules():
+        module.register_forward_hook(nan_hook)
+        
+    for module in model.modules():
+        module.register_forward_hook(grad_hook)
+            
+        
+    # for module in model.modules():
+    #     module.register_full_backward_hook(nan_backward_hook)
+        
     augment_disable_flag = False
     with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:
         total_it_each_epoch = len(train_loader)

@@ -368,7 +368,6 @@ class TransFusionHead(nn.Module):
                 # centernet_utils.draw_gaussian_to_heatmap(heatmap[gt_labels_3d[idx]], center_int, radius)
                 centernet_utils.draw_gaussian_to_heatmap(heatmap[gt_labels_3d[idx]], center_int[[1,0]], radius)
 
-
         mean_iou = ious[pos_inds].sum() / max(len(pos_inds), 1)
         return (labels[None], label_weights[None], bbox_targets[None], bbox_weights[None], int(pos_inds.shape[0]), float(mean_iou), heatmap[None])
 
@@ -475,7 +474,6 @@ class TransFusionHead(nn.Module):
         height = height - dim[:, 2:3, :] * 0.5 
         rots, rotc = rot[:, 0:1, :], rot[:, 1:2, :]
         rot = torch.atan2(rots, rotc)
-
         if vel is None:
             final_box_preds = torch.cat([center, height, dim, rot], dim=1).permute(0, 2, 1)
         else:

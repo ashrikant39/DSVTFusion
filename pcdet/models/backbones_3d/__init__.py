@@ -3,6 +3,7 @@ from .spconv_backbone import VoxelBackBone8x, VoxelResBackBone8x
 from .spconv_backbone_focal import VoxelBackBone8xFocal
 from .spconv_unet import UNetV2
 from .dsvt import DSVT, DSVT_TrtEngine
+from .dsvt_cross_attention import DSVTCrossAttention
 
 __all__ = {
     'VoxelBackBone8x': VoxelBackBone8x,
@@ -13,4 +14,5 @@ __all__ = {
     'VoxelBackBone8xFocal': VoxelBackBone8xFocal,
     'DSVT': DSVT,
     'DSVT_TrtEngine': DSVT_TrtEngine,
+    'DSVTCrossAttention': DSVTCrossAttention,
 }
