@@ -307,6 +307,72 @@ class TransfusionWrapper(nn.Module):
         else:
             pred_dicts, recall_dicts = self.post_processing(batch_dict)
             return pred_dicts, recall_dicts
+        
+
+class TransFusionTemporalModel(TransFusion):    
+    
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        
+        
+    def process_boxes(self, box_dicts):
+        
+        num_boxes = []
+        batch_size = len(box_dicts)
+                
+        for idx, box_dict in enumerate(box_dicts):
+            
+            scores = box_dict['pred_scores']
+            thresh_mask = scores > 0.5 * max(scores)
+            num_boxes.append(thresh_mask.sum().item())
+            
+            box_dicts[idx]['pred_scores'] = box_dict['pred_scores'][thresh_mask]
+            box_dicts[idx]['pred_boxes'] = box_dict['pred_boxes'][thresh_mask]
+            box_dicts[idx]['pred_labels'] = box_dict['pred_labels'][thresh_mask]
+        
+        num_max_boxes = max(num_boxes)
+        processed_boxes = torch.zeros((batch_size, num_max_boxes, 10)).to(box_dicts[0]['pred_boxes'])
+        
+        for idx, curr_num_boxes in enumerate(num_boxes):
+            processed_boxes[idx][:curr_num_boxes] = torch.cat([box_dicts[idx]['pred_boxes'], box_dicts[idx]['pred_labels'][:, None]], dim=1)
+        
+        return processed_boxes
+    
+    
+    def forward(self, batch_dict):
+        
+        prev_batch_dict = batch_dict.copy()
+        prev_batch_dict['points'] = batch_dict['prev_points']
+        
+        gt_boxes = batch_dict['gt_boxes']
+        prev_batch_dict['prev_boxes'] = torch.empty((0, 0, 10)).to(gt_boxes)
+        
+        with torch.no_grad():        
+            for cur_module in self.module_list:
+                cur_module.training = False
+                prev_batch_dict = cur_module(prev_batch_dict)
+            
+            box_dicts = prev_batch_dict['final_box_dicts']
+            batch_dict['prev_boxes'] = self.process_boxes(box_dicts)
+        
+        for cur_module in self.module_list:
+            
+            if self.training:
+                cur_module.training = True
+                
+            batch_dict = cur_module(batch_dict)
+        
+        if self.training:
+            loss, tb_dict, disp_dict = self.get_training_loss(batch_dict)
+
+            ret_dict = {
+                'loss': loss
+            }
+            return ret_dict, tb_dict, disp_dict
+        else:
+            pred_dicts, recall_dicts = self.post_processing(batch_dict)
+            return pred_dicts, recall_dicts
+    
     
 # class TransfusionTemporalWrapper(nn.Module):
     

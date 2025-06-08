@@ -368,10 +368,16 @@ class NuScenesTemporalDataset(DatasetTemplate):
 
         input_dict = {
             'points': points,
-            'prev_points': prev_points,
             'frame_id': Path(info['lidar_path']).stem,
             'metadata': {'token': info['token']}
         }
+
+        prev_dict = {
+            'points': prev_points,
+            'frame_id':  Path(info['lidar_path']).stem,
+            'metadata': {'token': info['token']}
+        }
+
 
         if 'gt_boxes' in info:
             if self.dataset_cfg.get('FILTER_MIN_POINTS_IN_GT', False):
@@ -383,8 +389,21 @@ class NuScenesTemporalDataset(DatasetTemplate):
                 'gt_names': info['gt_names'] if mask is None else info['gt_names'][mask],
                 'gt_boxes': info['gt_boxes'] if mask is None else info['gt_boxes'][mask]
             })
-
+            
+            prev_dict.update({
+                'gt_names': info['gt_names'] if mask is None else info['gt_names'][mask],
+                'gt_boxes': info['gt_boxes'] if mask is None else info['gt_boxes'][mask]
+            })
+        
+        random_seed = np.random.randint(0, 100000)
+        np.random.seed(random_seed)
         data_dict = self.prepare_data(data_dict=input_dict)
+        
+        np.random.seed(random_seed)
+        prev_dict = self.prepare_data(data_dict=prev_dict)
+        data_dict['prev_points'] = prev_dict['points']
+
+        del prev_dict
 
         if self.dataset_cfg.get('SET_NAN_VELOCITY_TO_ZEROS', False):
             gt_boxes = data_dict['gt_boxes']
@@ -496,6 +515,35 @@ class NuScenesTemporalDataset(DatasetTemplate):
         with open(db_info_save_path, 'wb') as f:
             pickle.dump(all_db_infos, f)
 
+
+
+class NuScenesFullSweepTemporalDataset(NuScenesDataset):
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(args, kwargs)
+
+
+    def __getitem__(self, index):
+        
+        random_seed = np.random.randint(0, 100000)
+        
+        np.random.seed(random_seed)
+        data_dict_prev = super().__getitem__(index)
+
+        np.random.seed(random_seed)
+        data_dict_curr = super().__getitem__(index+1)
+        
+        data_dict = dict()
+        data_dict.update(data_dict_curr)
+        
+        for key, data in data_dict_prev.items():
+            data_dict[f"prev_{key}"] = data
+
+        return data_dict
+    
+
+    def __len__(self):
+        return super().__len__() - 1
 
 def create_nuscenes_info(version, data_path, save_path, max_sweeps=10):
     from nuscenes.nuscenes import NuScenes

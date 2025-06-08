@@ -249,13 +249,6 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 merge_all_iters_to_one_epoch=False,
                 use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, fp16=False, cfg=None):
     accumulated_iter = start_iter   
-
-    for module in model.modules():
-        module.register_forward_hook(nan_hook)
-        
-    for module in model.modules():
-        module.register_forward_hook(grad_hook)
-            
         
     # for module in model.modules():
     #     module.register_full_backward_hook(nan_backward_hook)

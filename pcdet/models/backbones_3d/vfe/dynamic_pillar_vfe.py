@@ -68,17 +68,31 @@ def get_points_in_box(points, boxes, box_batch_idxs):
 #     return final_in_box_mask
 
 
-def encode_bbox(bboxes):
+def encode_bbox(bboxes, pcd_range):
     
     # [x, y, z, w, l, h, yaw, vx, vy, class_id]
     targets = torch.zeros([bboxes.shape[0], 10]).to(bboxes)
-    targets[:, :3] = bboxes[:, :3] # xyz
+    targets[:, :3] = (bboxes[:, :3] - pcd_range[:3])/(pcd_range[3:] - pcd_range[:3]) # xyz
     targets[:, 3:6] = bboxes[:, 3:6].log() # lwh
     targets[:, 6] = torch.sin(bboxes[:, 6]) # sin yaw
     targets[:, 7] = torch.cos(bboxes[:, 6]) # cos yaw
     targets[:, 8:10] = bboxes[:, 7:9] # vx, vy
     
     return targets
+
+
+
+def decode_bbox(bboxes, pcd_range):
+    
+    # [x, y, z, log w, log l, log h, sin yaw, cos yaw, vx, vy]
+    
+    xyz = bboxes[:, :3] * (pcd_range[3:] - pcd_range[:3]) + pcd_range[:3] # xyz
+    lwh = bboxes[:, 3:6].exp() # lwh
+    yaw = torch.atan2(bboxes[:, 6:7], bboxes[:, 7:8]) # sin yaw
+    velocity = bboxes[:, 8:10] # vx, vy    
+
+    return torch.cat([xyz, lwh, yaw, velocity], dim=1)
+
 
 
 class PFNLayerV2(nn.Module):
@@ -114,7 +128,48 @@ class PFNLayerV2(nn.Module):
         else:
             x_concatenated = torch.cat([x, x_max[unq_inv, :]], dim=1)
             return x_concatenated
+        
+        
+class ResidualMotion(nn.Module):
+    
+    def __init__(self, in_features):
+        
+        super().__init__()
+        
+        self.mlp = nn.Sequential(
+            nn.Linear(in_features=in_features, out_features=in_features*2),
+            nn.BatchNorm1d(num_features=in_features*2),
+            nn.ReLU(inplace=True),
+            
+            nn.Linear(in_features=in_features*2, out_features=in_features*4),
+            nn.BatchNorm1d(num_features=in_features*4),
+            nn.ReLU(inplace=True),
+            
+            nn.Linear(in_features=in_features*4, out_features=in_features*2),
+            nn.BatchNorm1d(num_features=in_features*2),
+            nn.ReLU(inplace=True),
+        )
+        
+        self.output_layer = nn.Linear(in_features=in_features*2, out_features=in_features)
+        
+        self.init_weights()
+        
+    
+    def init_weights(self):
+        
+        for m in self.mlp.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                nn.init.zeros_(m.bias)
+        
+        nn.init.normal_(self.output_layer.weight, mean=0.0, std=1e-3)
+        nn.init.zeros_(self.output_layer.bias)
+        
+        
+    def forward(self, x):
+        return x + self.output_layer(self.mlp(x))
 
+        
 
 class DynamicPillarVFE(VFETemplate):
     def __init__(self, model_cfg, num_point_features, voxel_size, grid_size, point_cloud_range, **kwargs):
@@ -707,7 +762,7 @@ class DynamicPillarWithClassSeg(VFETemplate):
             valid_box_batch_idxs = batch_idxs[valid_box_mask]
             
 
-            final_in_box_mask = get_points_in_box(points, gt_boxes, valid_box_batch_idxs, self.num_classes)
+            final_in_box_mask = get_points_in_box(points, gt_boxes, valid_box_batch_idxs)
             point_idxs, box_idxs = torch.where(final_in_box_mask)  
             
             class_labels_to_points = torch.full((num_points,), fill_value=self.num_classes, device=points.device, dtype=torch.long)
@@ -745,6 +800,7 @@ class DynamicPillarWithFullBoxSeg(VFETemplate):
         num_point_features += 6 if self.use_absolute_xyz else 3
         self.token_dim = self.model_cfg.TOKEN_DIM
         self.num_classes = self.model_cfg.NUM_CLASSES
+        self.box_key = self.model_cfg.BOX_KEY 
         
         if self.with_distance:
             num_point_features += 1
@@ -782,7 +838,7 @@ class DynamicPillarWithFullBoxSeg(VFETemplate):
         self.point_cloud_range = torch.tensor(point_cloud_range).cuda()
         
         self.box_null_token = nn.Parameter(torch.randn(10), requires_grad=False)
-        self.mask_token = nn.Parameter(torch.randn(self.num_classes + 1, self.token_dim,), requires_grad=False)     
+        self.mask_token = nn.Parameter(torch.randn(self.num_classes + 1, self.token_dim,), requires_grad=False)
 
     def get_output_feature_dim(self):
         return self.num_filters[-1]
@@ -825,30 +881,175 @@ class DynamicPillarWithFullBoxSeg(VFETemplate):
         features = torch.cat(features, dim=-1)
         # uniq_inv -> A mapping on how to combine points belonging to the same pillar
         
-        gt_boxes = batch_dict['gt_boxes']
-        batch_size, seq_len, _ = gt_boxes.shape
+        boxes = batch_dict[self.box_key]
+        batch_size, seq_len, _ = boxes.shape
         
-        full_feature = torch.repeat_interleave(torch.cat([self.box_null_token, self.mask_token[-1]], dim=0)[None, :], repeats=len(features), dim=0).to(gt_boxes)
+        full_feature = torch.repeat_interleave(torch.cat([self.box_null_token, self.mask_token[-1]], dim=0)[None, :], repeats=len(features), dim=0).to(boxes)
 
-        if 0 not in gt_boxes.shape:
+        if 0 not in boxes.shape:
     
-            gt_boxes = gt_boxes.reshape(batch_size*seq_len, -1)
+            boxes = boxes.reshape(batch_size*seq_len, -1)
                                                             
-            valid_box_mask = (gt_boxes.sum(dim=-1) != 0)
-            gt_boxes = gt_boxes[valid_box_mask]
+            valid_box_mask = (boxes.sum(dim=-1) != 0)
+            boxes = boxes[valid_box_mask]
                         
             batch_idxs = torch.arange(batch_size, device=points.device).view(batch_size, 1, 1).expand(-1, seq_len, 1).reshape(-1,1)
             valid_box_batch_idxs = batch_idxs[valid_box_mask]
                      
-            final_in_box_mask = get_points_in_box(points, gt_boxes, valid_box_batch_idxs)
+            final_in_box_mask = get_points_in_box(points, boxes, valid_box_batch_idxs)
             point_idxs, box_idxs = torch.where(final_in_box_mask)
             
-            class_labels = gt_boxes[box_idxs][:,-1].long() - 1
+            class_labels = boxes[box_idxs][:,-1].long() - 1
             
-            encoded_boxes = encode_bbox(gt_boxes)
+            encoded_boxes = encode_bbox(boxes)
             
-            full_feature[point_idxs][:, :10] = encoded_boxes[box_idxs]
-            full_feature[point_idxs][:, 10:] = self.mask_token[class_labels]
+            full_feature[point_idxs, :10] = encoded_boxes[box_idxs]
+            full_feature[point_idxs, 10:] = self.mask_token[class_labels]
+        
+        #                   (N_full, 11)
+        features = torch.cat([features, full_feature], dim=1)
+                
+        for pfn in self.pfn_layers:
+            features = pfn(features, unq_inv)
+
+        # generate voxel coordinates
+        unq_coords = unq_coords.int()
+        voxel_coords = torch.stack((unq_coords // self.scale_xy,
+                                    (unq_coords % self.scale_xy) // self.scale_y,
+                                    unq_coords % self.scale_y,
+                                    torch.zeros(unq_coords.shape[0]).to(unq_coords.device).int()
+                                    ), dim=1)
+        voxel_coords = voxel_coords[:, [0, 3, 2, 1]]                    
+                    
+        batch_dict['pillar_features'] = batch_dict['voxel_features'] = features
+        batch_dict['voxel_coords'] = voxel_coords
+        batch_dict['voxel_size'] = self.voxel_size
+        
+        return batch_dict
+
+
+class DynamicForwardPillarWithFullBox(VFETemplate):
+    def __init__(self, model_cfg, num_point_features, voxel_size, grid_size, point_cloud_range, **kwargs):
+        super().__init__(model_cfg=model_cfg)
+
+        self.use_norm = self.model_cfg.USE_NORM
+        self.with_distance = self.model_cfg.WITH_DISTANCE
+        self.use_absolute_xyz = self.model_cfg.USE_ABSLOTE_XYZ
+        num_point_features += 6 if self.use_absolute_xyz else 3
+        self.token_dim = self.model_cfg.TOKEN_DIM
+        self.num_classes = self.model_cfg.NUM_CLASSES
+        self.box_key = self.model_cfg.BOX_KEY 
+        
+        if self.with_distance:
+            num_point_features += 1
+
+        
+        num_point_features += self.token_dim # for class label
+        num_point_features += 10 # for box info
+        
+        
+        self.num_filters = self.model_cfg.NUM_FILTERS
+        assert len(self.num_filters) > 0
+        num_filters = [num_point_features] + list(self.num_filters)
+
+        pfn_layers = []
+        for i in range(len(num_filters) - 1):
+            in_filters = num_filters[i]
+            out_filters = num_filters[i + 1]
+            pfn_layers.append(
+                PFNLayerV2(in_filters, out_filters, self.use_norm, last_layer=(i >= len(num_filters) - 2))
+            )
+        self.pfn_layers = nn.ModuleList(pfn_layers)
+
+        self.voxel_x = voxel_size[0]
+        self.voxel_y = voxel_size[1]
+        self.voxel_z = voxel_size[2]
+        self.x_offset = self.voxel_x / 2 + point_cloud_range[0]
+        self.y_offset = self.voxel_y / 2 + point_cloud_range[1]
+        self.z_offset = self.voxel_z / 2 + point_cloud_range[2]
+
+        self.scale_xy = grid_size[0] * grid_size[1]
+        self.scale_y = grid_size[1]
+
+        self.grid_size = torch.tensor(grid_size).cuda()
+        self.voxel_size = torch.tensor(voxel_size).cuda()
+        self.point_cloud_range = torch.tensor(point_cloud_range).cuda()
+
+        self.motion_model = ResidualMotion(in_features=10)
+
+        self.box_null_token = nn.Parameter(torch.randn(10), requires_grad=False)
+        self.mask_token = nn.Parameter(torch.randn(self.num_classes + 1, self.token_dim,), requires_grad=False)
+
+    def get_output_feature_dim(self):
+        return self.num_filters[-1]
+    
+
+    def forward(self, batch_dict, **kwargs):
+        points = batch_dict['points'] # (batch_idx, x, y, z, i, e)
+
+        points_coords = torch.floor((points[:, [1,2]] - self.point_cloud_range[[0,1]]) / self.voxel_size[[0,1]]).int()
+        mask = ((points_coords >= 0) & (points_coords < self.grid_size[[0,1]])).all(dim=1)
+        points = points[mask]
+        points_coords = points_coords[mask]
+        points_xyz = points[:, [1, 2, 3]].contiguous()
+        
+        # points -> batch_idx, x, y, z, i, e
+        # points_coords -> x_idx, y_idx
+        # Batch_idx * (H*W) + x_idx * grid_size + y_idx
+        merge_coords = points[:, 0].int() * self.scale_xy + \
+                       points_coords[:, 0] * self.scale_y + \
+                       points_coords[:, 1]
+
+        unq_coords, unq_inv, unq_cnt = torch.unique(merge_coords, return_inverse=True, return_counts=True, dim=0)
+
+        points_mean = torch_scatter.scatter_mean(points_xyz, unq_inv, dim=0)
+        f_cluster = points_xyz - points_mean[unq_inv, :]
+
+        f_center = torch.zeros_like(points_xyz)
+        f_center[:, 0] = points_xyz[:, 0] - (points_coords[:, 0].to(points_xyz.dtype) * self.voxel_x + self.x_offset)
+        f_center[:, 1] = points_xyz[:, 1] - (points_coords[:, 1].to(points_xyz.dtype) * self.voxel_y + self.y_offset)
+        f_center[:, 2] = points_xyz[:, 2] - self.z_offset
+
+        if self.use_absolute_xyz:
+            features = [points[:, 1:], f_cluster, f_center]
+        else:
+            features = [points[:, 4:], f_cluster, f_center]
+
+        if self.with_distance:
+            points_dist = torch.norm(points[:, 1:4], 2, dim=1, keepdim=True)
+            features.append(points_dist)
+        features = torch.cat(features, dim=-1)
+        # uniq_inv -> A mapping on how to combine points belonging to the same pillar
+        
+        guidance_boxes = batch_dict[self.box_key]
+        batch_size, seq_len, _ = guidance_boxes.shape
+        
+        full_feature = torch.repeat_interleave(torch.cat([self.box_null_token, self.mask_token[-1]], dim=0)[None, :], repeats=len(features), dim=0).to(guidance_boxes)
+
+        if 0 not in guidance_boxes.shape:
+    
+            guidance_boxes = guidance_boxes.reshape(batch_size*seq_len, -1)
+                                                            
+            valid_box_mask = (guidance_boxes.sum(dim=-1) != 0)
+            guidance_boxes = guidance_boxes[valid_box_mask]
+            
+            all_class_labels = guidance_boxes[:, -1].long() - 1
+            
+            encoded_guidance_boxes = encode_bbox(guidance_boxes, self.point_cloud_range)
+            predicted_guidance_boxes = self.motion_model(encoded_guidance_boxes)
+            decoded_bbox = decode_bbox(torch.cat([predicted_guidance_boxes, encoded_guidance_boxes[:, -1:]], dim=1), self.point_cloud_range)
+            
+            batch_idxs = torch.arange(batch_size, device=points.device).view(batch_size, 1, 1).expand(-1, seq_len, 1).reshape(-1,1)
+            valid_box_batch_idxs = batch_idxs[valid_box_mask]
+                     
+            final_in_box_mask = get_points_in_box(points, decoded_bbox, valid_box_batch_idxs)
+            
+                
+            point_idxs, box_idxs = torch.where(final_in_box_mask)
+            
+            class_labels = all_class_labels[box_idxs]
+            full_feature[point_idxs, :10] = predicted_guidance_boxes[box_idxs]
+            full_feature[point_idxs, 10:] = self.mask_token[class_labels]
         
         #                   (N_full, 11)
         features = torch.cat([features, full_feature], dim=1)
