@@ -4,6 +4,42 @@ import torch
 import torch.nn as nn
 import os
 from ...utils.spconv_utils import find_all_spconv_keys
+import math
+from einops import rearrange
+
+
+def sinusoidal_time_embedding(boxes:torch.Tensor) -> torch.Tensor:
+    """
+    Adds sinusoidal time embeddings to a tensor of shape (B, T, N, D)
+    
+    Args:
+        x: Input tensor of shape (B, T, N, D), where
+           B = batch size
+           T = number of time steps
+           N = number of spatial tokens per time step
+           D = feature dimension (must be even)
+           
+    Returns:
+        Tensor with sinusoidal time embeddings added to the input.
+    """
+
+
+    _, T, _, D = boxes.shape 
+    assert D % 2 == 0, "Feature dimension must be even for sinusoidal embeddings."
+
+    # Create time positions [0, 1, ..., T-1]
+    position = torch.arange(T).unsqueeze(1).to(boxes)  # (T, 1)
+    div_term = torch.exp(torch.arange(0, D, 2).to(boxes) * (-math.log(10000.0) / D))  # (D/2,)
+
+    pe = torch.zeros(T, D).to(boxes)  # (T, D)
+    pe[:, 0::2] = torch.sin(position * div_term)
+    pe[:, 1::2] = torch.cos(position * div_term)
+
+    # Expand to match input shape: (1, T, 1, D):
+    pe = pe.unsqueeze(0).unsqueeze(2)
+    return pe
+
+
 
 # def get_voxel_centers_in_boxes(gt_boxes, voxel_size):
 #     """
@@ -72,6 +108,56 @@ from ...utils.spconv_utils import find_all_spconv_keys
 #     in_bound = (grid <= dims).all(dim=-1)  # (B, N, G)
 
 #     return voxel_centers, in_bound  # (B,N,G,3), (B,N,G)
+
+
+class TemporalBoxDecoder(nn.Module):
+
+    def __init__(self, box_dim, feature_dim, n_heads, n_layers, n_embeddings) -> None:
+        super().__init__()
+        
+
+        self.box_to_feature = nn.Sequential(
+                nn.Linear(in_features=box_dim, out_features=feature_dim),
+                nn.ReLU(inplace=True)
+                )
+        
+        self.decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=feature_dim, nhead=n_heads, dim_feedforward=feature_dim, batch_first=True), num_layers=n_layers)
+        self.queries = nn.Embedding(n_embeddings, feature_dim)
+        self.feature_to_box = nn.Linear(in_features=feature_dim, out_features=box_dim)
+
+        self.box_dim = box_dim
+        self.feature_dim = feature_dim
+        self.n_heads = n_heads
+        self.n_layers = n_layers
+
+    def forward(self, boxes:torch.Tensor):
+        """
+        Given boxes from previous timesteps, this model is to learn a transformation for the box.
+        Each box from t_a to T are treated independently (there is no temporal relation between boxes)
+        The prediction happens from t_a to T.
+
+
+        Make use of learnt queries to get proposed regions to perform point labeling.
+        """
+        # boxes -> (batch_size, num_timesteps, num_boxes, box_dim)
+        batch_size, num_timesteps, num_boxes, box_dim  = boxes.shape
+        boxes = rearrange(boxes, 'b t n f -> (b t n) f')
+
+        padding_mask = (boxes.abs().sum(dim=-1) == 0).reshape(batch_size, -1)
+        box_feats = self.box_to_feature(boxes)
+        box_feats = box_feats.reshape((batch_size, num_timesteps, num_boxes, self.feature_dim))
+
+        box_feats += sinusoidal_time_embedding(boxes)
+
+        box_feats = rearrange(box_feats, 'b t n f -> b (t n) f')
+        queries = self.queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
+
+        query_feats = self.decoder(tgt=queries, memory=box_feats, memory_key_padding_mask=padding_mask)
+        
+        pred_boxes = self.feature_to_box(query_feats)
+        return pred_boxes
+
+
 
 
 
@@ -313,7 +399,20 @@ class TransFusionTemporalModel(TransFusion):
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+
+        for module in self.module_list:
+            for param in module.parameters():
+                param.requires_grad = False
         
+        
+        self.temporal_box_model = TemporalBoxDecoder(
+                box_dim = kwargs.get('box_dim', 10),
+                feature_dim = kwargs.get('box_decoder_feature_dim', 32),
+                n_heads = kwargs.get('n_box_decoder_heads', 2),
+                n_layers = kwargs.get('n_box_decoder_layers', 6),
+                n_embeddings = kwargs.get('n_box_decoder_embeds', 200)
+            )
+
         
     def process_boxes(self, box_dicts):
         
@@ -338,6 +437,10 @@ class TransFusionTemporalModel(TransFusion):
         
         return processed_boxes
     
+
+    def train_box_decoder(self, batch_dict):
+        
+        prev_boxes = batch_dict['prev_gt_boxes']
     
     def forward(self, batch_dict):
         

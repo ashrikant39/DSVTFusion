@@ -130,7 +130,7 @@ class DatasetTemplate(torch_data.Dataset):
         """
         raise NotImplementedError
 
-    def prepare_data(self, data_dict):
+    def prepare_data(self, data_dict, rng = None):
         """
         Args:
             data_dict:
@@ -161,7 +161,8 @@ class DatasetTemplate(torch_data.Dataset):
                 data_dict={
                     **data_dict,
                     'gt_boxes_mask': gt_boxes_mask
-                }
+                },
+                rng = rng
             )
             if 'calib' in data_dict:
                 data_dict['calib'] = calib

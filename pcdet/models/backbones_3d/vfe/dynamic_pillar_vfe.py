@@ -1,6 +1,8 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import math
+from einops import rearrange
 
 try:
     import torch_scatter
@@ -37,6 +39,38 @@ def get_points_in_box(points, boxes, box_batch_idxs):
     final_in_box_mask = torch.logical_and(geom_mask, batch_mask)
     return final_in_box_mask
 
+
+
+# def sinusoidal_time_embedding(boxes:torch.Tensor) -> torch.Tensor:
+#     """
+#     Adds sinusoidal time embeddings to a tensor of shape (B, T, N, D)
+    
+#     Args:
+#         x: Input tensor of shape (B, T, N, D), where
+#            B = batch size
+#            T = number of time steps
+#            N = number of spatial tokens per time step
+#            D = feature dimension (must be even)
+           
+#     Returns:
+#         Tensor with sinusoidal time embeddings added to the input.
+#     """
+
+
+#     B, T, N, D = boxes.shape 
+#     assert D % 2 == 0, "Feature dimension must be even for sinusoidal embeddings."
+
+#     # Create time positions [0, 1, ..., T-1]
+#     position = torch.arange(T).unsqueeze(1).to(boxes)  # (T, 1)
+#     div_term = torch.exp(torch.arange(0, D, 2).to(boxes) * (-math.log(10000.0) / D))  # (D/2,)
+
+#     pe = torch.zeros(T, D).to(boxes)  # (T, D)
+#     pe[:, 0::2] = torch.sin(position * div_term)
+#     pe[:, 1::2] = torch.cos(position * div_term)
+
+#     # Expand to match input shape: (1, T, 1, D):
+#     pe = pe.unsqueeze(0).unsqueeze(2)
+#     return pe
 
 # def get_points_in_box_with_class(points, boxes, box_batch_idxs):
 #     """
@@ -170,6 +204,54 @@ class ResidualMotion(nn.Module):
         return x + self.output_layer(self.mlp(x))
 
         
+
+# class TemporalBoxDecoder(nn.Module):
+
+#     def __init__(self, box_dim, feature_dim, n_heads, n_layers, n_embeddings) -> None:
+#         super().__init__()
+        
+
+#         self.box_to_feature = nn.Sequential(
+#                 nn.Linear(in_features=box_dim, out_features=feature_dim),
+#                 nn.ReLU(inplace=True)
+#                 )
+        
+#         self.decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=feature_dim, nhead=n_heads, dim_feedforward=feature_dim, batch_first=True), num_layers=n_layers)
+#         self.queries = nn.Embedding(n_embeddings, feature_dim)
+#         self.feature_to_box = nn.Linear(in_features=feature_dim, out_features=box_dim)
+
+#         self.box_dim = box_dim
+#         self.feature_dim = feature_dim
+#         self.n_heads = n_heads
+#         self.n_layers = n_layers
+
+#     def forward(self, boxes:torch.Tensor):
+#         """
+#         Given boxes from previous timesteps, this model is to learn a transformation for the box.
+#         Each box from t_a to T are treated independently (there is no temporal relation between boxes)
+#         The prediction happens from t_a to T.
+
+
+#         Make use of learnt queries to get proposed regions to perform point labeling.
+#         """
+#         # boxes -> (batch_size, num_timesteps, num_boxes, box_dim)
+#         batch_size, num_timesteps, num_boxes, box_dim  = boxes.shape
+#         boxes = rearrange(boxes, 'b t n f -> (b t n) f')
+
+#         padding_mask = (boxes.abs().sum(dim=-1) == 0).reshape(batch_size, -1)
+#         box_feats = self.box_to_feature(boxes)
+#         box_feats = box_feats.reshape((batch_size, num_timesteps, num_boxes, self.feature_dim))
+
+#         box_feats += sinusoidal_time_embedding(boxes)
+
+#         box_feats = rearrange(box_feats, 'b t n f -> b (t n) f')
+#         queries = self.queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
+
+#         query_feats = self.decoder(tgt=queries, memory=box_feats, memory_key_padding_mask=padding_mask)
+        
+#         pred_boxes = self.feature_to_box(query_feats)
+
+
 
 class DynamicPillarVFE(VFETemplate):
     def __init__(self, model_cfg, num_point_features, voxel_size, grid_size, point_cloud_range, **kwargs):
@@ -1043,8 +1125,6 @@ class DynamicForwardPillarWithFullBox(VFETemplate):
             valid_box_batch_idxs = batch_idxs[valid_box_mask]
                      
             final_in_box_mask = get_points_in_box(points, decoded_bbox, valid_box_batch_idxs)
-            
-                
             point_idxs, box_idxs = torch.where(final_in_box_mask)
             
             class_labels = all_class_labels[box_idxs]

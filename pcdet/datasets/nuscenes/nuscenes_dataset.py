@@ -32,7 +32,7 @@ class NuScenesDataset(DatasetTemplate):
             with open(info_path, 'rb') as f:
                 infos = pickle.load(f)
                 nuscenes_infos.extend(infos)
-
+        
         self.infos.extend(nuscenes_infos)
         self.logger.info('Total samples for NuScenes dataset: %d' % (len(nuscenes_infos)))
 
@@ -519,31 +519,88 @@ class NuScenesTemporalDataset(DatasetTemplate):
 
 class NuScenesFullSweepTemporalDataset(NuScenesDataset):
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(args, kwargs)
+    def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None, num_timesteps = 3):
+
+        dataset_cfg.BALANCED_RESAMPLING = False
+        super().__init__(dataset_cfg, class_names, training, root_path, logger)
+
+        self.infos.sort(key = lambda data: data['timestamp'])
+
+        self.num_timesteps = num_timesteps
+    
+
+    def load_data(self, index, rng = None):
+
+        if self._merge_all_iters_to_one_epoch:
+            index = index % len(self.infos)
+
+        info = copy.deepcopy(self.infos[index])
+        points = self.get_lidar_with_sweeps(index, max_sweeps=self.dataset_cfg.MAX_SWEEPS)
+
+        input_dict = {
+            'points': points,
+            'frame_id': Path(info['lidar_path']).stem,
+            'metadata': {'token': info['token']}
+        }
+
+        if 'gt_boxes' in info:
+            if self.dataset_cfg.get('FILTER_MIN_POINTS_IN_GT', False):
+                mask = (info['num_lidar_pts'] > self.dataset_cfg.FILTER_MIN_POINTS_IN_GT - 1)
+            else:
+                mask = None
+
+            input_dict.update({
+                'gt_names': info['gt_names'] if mask is None else info['gt_names'][mask],
+                'gt_boxes': info['gt_boxes'] if mask is None else info['gt_boxes'][mask]
+            })
+
+        data_dict = self.prepare_data(data_dict=input_dict, rng = rng)
+
+        if self.dataset_cfg.get('SET_NAN_VELOCITY_TO_ZEROS', False):
+            gt_boxes = data_dict['gt_boxes']
+            gt_boxes[np.isnan(gt_boxes)] = 0
+            data_dict['gt_boxes'] = gt_boxes
+
+        if not self.dataset_cfg.PRED_VELOCITY and 'gt_boxes' in data_dict:
+            data_dict['gt_boxes'] = data_dict['gt_boxes'][:, [0, 1, 2, 3, 4, 5, 6, -1]]
+
+        data_dict['timestamp'] = info['timestamp']
+
+        return data_dict
 
 
     def __getitem__(self, index):
-        
-        random_seed = np.random.randint(0, 100000)
-        
-        np.random.seed(random_seed)
-        data_dict_prev = super().__getitem__(index)
 
-        np.random.seed(random_seed)
-        data_dict_curr = super().__getitem__(index+1)
+        random_seed = np.random.randint(0, 100000) 
+        rng = np.random.RandomState(random_seed)
         
-        data_dict = dict()
-        data_dict.update(data_dict_curr)
+        # t = t
+        data_dict = self.load_data(index + self.num_timesteps, rng=rng)
+        # ['points', 'frame_id', 'metadata', 'gt_boxes', 'flip_x', 'flip_y', 'noise_rot', 'noise_scale', 'use_lead_xyz']
+        # points -> (N, 5)
+        # frame_id -> str
+        # metadata -> dict(str)
+        # gt_boxes -> (Nb, 10)
+        # flip_x, flip_y, use_lead_xyz -> bool
+        # noise_rot, noise_scale -> float values
         
-        for key, data in data_dict_prev.items():
-            data_dict[f"prev_{key}"] = data
+        data_dict['prev_points'] = []
+        data_dict['prev_boxes'] = []
+
+        # t = t-1, t-2, .., t-self.num_timesteps in reverse order
+
+        for shift_idx in range(self.num_timesteps):    
+            prev_data = self.load_data(index + shift_idx, rng = rng)
+            data_dict['prev_points'].append(prev_data['points'])
+            data_dict['prev_boxes'].append(prev_data['gt_boxes'])
 
         return data_dict
     
 
     def __len__(self):
-        return super().__len__() - 1
+        return super().__len__() - self.num_timesteps
+
+
 
 def create_nuscenes_info(version, data_path, save_path, max_sweeps=10):
     from nuscenes.nuscenes import NuScenes

@@ -5,15 +5,18 @@ from ...utils import common_utils
 from ...utils import box_utils
 
 
-def random_flip_along_x(gt_boxes, points, return_flip=False, enable=None):
+def random_flip_along_x(gt_boxes, points, return_flip=False, enable=None, rng = None):
     """
     Args:
         gt_boxes: (N, 7 + C), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
         points: (M, 3 + C)
     Returns:
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     if enable is None:
-        enable = np.random.choice([False, True], replace=False, p=[0.5, 0.5])
+        enable = rng.choice([False, True], replace=False, p=[0.5, 0.5])
     if enable:
         gt_boxes[:, 1] = -gt_boxes[:, 1]
         gt_boxes[:, 6] = -gt_boxes[:, 6]
@@ -26,15 +29,18 @@ def random_flip_along_x(gt_boxes, points, return_flip=False, enable=None):
     return gt_boxes, points
 
 
-def random_flip_along_y(gt_boxes, points, return_flip=False, enable=None):
+def random_flip_along_y(gt_boxes, points, return_flip=False, enable=None, rng = None):
     """
     Args:
         gt_boxes: (N, 7 + C), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
         points: (M, 3 + C)
     Returns:
     """
+    if rng is None:
+        rng = np.random.default_rng()
+
     if enable is None:
-        enable = np.random.choice([False, True], replace=False, p=[0.5, 0.5])
+        enable = rng.choice([False, True], replace=False, p=[0.5, 0.5])
     if enable:
         gt_boxes[:, 0] = -gt_boxes[:, 0]
         gt_boxes[:, 6] = -(gt_boxes[:, 6] + np.pi)
@@ -47,7 +53,7 @@ def random_flip_along_y(gt_boxes, points, return_flip=False, enable=None):
     return gt_boxes, points
 
 
-def global_rotation(gt_boxes, points, rot_range, return_rot=False, noise_rotation=None):
+def global_rotation(gt_boxes, points, rot_range, return_rot=False, noise_rotation=None, rng = None):
     """
     Args:
         gt_boxes: (N, 7 + C), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
@@ -55,8 +61,11 @@ def global_rotation(gt_boxes, points, rot_range, return_rot=False, noise_rotatio
         rot_range: [min, max]
     Returns:
     """
+    if rng is None:
+        rng = np.random.default_rng()
+    
     if noise_rotation is None: 
-        noise_rotation = np.random.uniform(rot_range[0], rot_range[1])
+        noise_rotation = rng.uniform(rot_range[0], rot_range[1])
     points = common_utils.rotate_points_along_z(points[np.newaxis, :, :], np.array([noise_rotation]))[0]
     gt_boxes[:, 0:3] = common_utils.rotate_points_along_z(gt_boxes[np.newaxis, :, 0:3], np.array([noise_rotation]))[0]
     gt_boxes[:, 6] += noise_rotation
@@ -71,7 +80,7 @@ def global_rotation(gt_boxes, points, rot_range, return_rot=False, noise_rotatio
     return gt_boxes, points
 
 
-def global_scaling(gt_boxes, points, scale_range, return_scale=False):
+def global_scaling(gt_boxes, points, scale_range, return_scale=False, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading]
@@ -79,9 +88,13 @@ def global_scaling(gt_boxes, points, scale_range, return_scale=False):
         scale_range: [min, max]
     Returns:
     """
+    
+    if rng is None:
+        rng = np.random.default_rng()
+    
     if scale_range[1] - scale_range[0] < 1e-3:
         return gt_boxes, points
-    noise_scale = np.random.uniform(scale_range[0], scale_range[1])
+    noise_scale = rng.uniform(scale_range[0], scale_range[1])
     points[:, :3] *= noise_scale
     gt_boxes[:, :6] *= noise_scale
     if gt_boxes.shape[1] > 7:
@@ -91,7 +104,7 @@ def global_scaling(gt_boxes, points, scale_range, return_scale=False):
         return gt_boxes, points, noise_scale
     return gt_boxes, points
 
-def global_scaling_with_roi_boxes(gt_boxes, roi_boxes, points, scale_range, return_scale=False):
+def global_scaling_with_roi_boxes(gt_boxes, roi_boxes, points, scale_range, return_scale=False, rng =None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading]
@@ -99,9 +112,13 @@ def global_scaling_with_roi_boxes(gt_boxes, roi_boxes, points, scale_range, retu
         scale_range: [min, max]
     Returns:
     """
+
+    if rng is None:
+        rng = np.random.default_rng()
+
     if scale_range[1] - scale_range[0] < 1e-3:
         return gt_boxes, points
-    noise_scale = np.random.uniform(scale_range[0], scale_range[1])
+    noise_scale = rng.uniform(scale_range[0], scale_range[1])
     points[:, :3] *= noise_scale
     gt_boxes[:, :6] *= noise_scale
     roi_boxes[:,:, [0,1,2,3,4,5,7,8]] *= noise_scale
@@ -110,7 +127,7 @@ def global_scaling_with_roi_boxes(gt_boxes, roi_boxes, points, scale_range, retu
     return gt_boxes, roi_boxes, points
 
 
-def random_image_flip_horizontal(image, depth_map, gt_boxes, calib):
+def random_image_flip_horizontal(image, depth_map, gt_boxes, calib, rng = None):
     """
     Performs random horizontal flip augmentation
     Args:
@@ -123,8 +140,12 @@ def random_image_flip_horizontal(image, depth_map, gt_boxes, calib):
         aug_depth_map: (H_depth, W_depth), Augmented depth map
         aug_gt_boxes: (N, 7), Augmented 3D box labels in LiDAR coordinates [x, y, z, w, l, h, ry]
     """
+
+    if rng is None:
+        rng = np.random.default_rng()    
+    
     # Randomly augment with 50% chance
-    enable = np.random.choice([False, True], replace=False, p=[0.5, 0.5])
+    enable = rng.choice([False, True], replace=False, p=[0.5, 0.5])
 
     if enable:
         # Flip images
@@ -150,7 +171,7 @@ def random_image_flip_horizontal(image, depth_map, gt_boxes, calib):
     return aug_image, aug_depth_map, aug_gt_boxes
 
 
-def random_local_translation_along_x(gt_boxes, points, offset_range):
+def random_local_translation_along_x(gt_boxes, points, offset_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
@@ -158,9 +179,13 @@ def random_local_translation_along_x(gt_boxes, points, offset_range):
         offset_range: [min max]]
     Returns:
     """
+    
+    if rng is None:
+        rng = np.random.default_rng()
+
     # augs = {}
     for idx, box in enumerate(gt_boxes):
-        offset = np.random.uniform(offset_range[0], offset_range[1])
+        offset = rng.uniform(offset_range[0], offset_range[1])
         # augs[f'object_{idx}'] = offset
         points_in_box, mask = get_points_in_box(points, box)
         points[mask, 0] += offset
@@ -173,7 +198,7 @@ def random_local_translation_along_x(gt_boxes, points, offset_range):
     return gt_boxes, points
 
 
-def random_local_translation_along_y(gt_boxes, points, offset_range):
+def random_local_translation_along_y(gt_boxes, points, offset_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
@@ -181,9 +206,13 @@ def random_local_translation_along_y(gt_boxes, points, offset_range):
         offset_range: [min max]]
     Returns:
     """
+    
+    if rng is None:
+        rng = np.random.default_rng()
+    
     # augs = {}
     for idx, box in enumerate(gt_boxes):
-        offset = np.random.uniform(offset_range[0], offset_range[1])
+        offset = rng.uniform(offset_range[0], offset_range[1])
         # augs[f'object_{idx}'] = offset
         points_in_box, mask = get_points_in_box(points, box)
         points[mask, 1] += offset
@@ -196,7 +225,7 @@ def random_local_translation_along_y(gt_boxes, points, offset_range):
     return gt_boxes, points
 
 
-def random_local_translation_along_z(gt_boxes, points, offset_range):
+def random_local_translation_along_z(gt_boxes, points, offset_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
@@ -204,9 +233,13 @@ def random_local_translation_along_z(gt_boxes, points, offset_range):
         offset_range: [min max]]
     Returns:
     """
+    
+    if rng is None:
+        rng = np.random.default_rng()
+
     # augs = {}
     for idx, box in enumerate(gt_boxes):
-        offset = np.random.uniform(offset_range[0], offset_range[1])
+        offset = rng.uniform(offset_range[0], offset_range[1])
         # augs[f'object_{idx}'] = offset
         points_in_box, mask = get_points_in_box(points, box)
         points[mask, 2] += offset
@@ -216,7 +249,7 @@ def random_local_translation_along_z(gt_boxes, points, offset_range):
     return gt_boxes, points
 
 
-def global_frustum_dropout_top(gt_boxes, points, intensity_range):
+def global_frustum_dropout_top(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -224,7 +257,10 @@ def global_frustum_dropout_top(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
-    intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+    if rng is None:
+        rng = np.random.default_rng()
+    
+    intensity = rng.uniform(intensity_range[0], intensity_range[1])
     # threshold = max - length * uniform(0 ~ 0.2)
     threshold = np.max(points[:, 2]) - intensity * (np.max(points[:, 2]) - np.min(points[:, 2]))
     
@@ -233,7 +269,7 @@ def global_frustum_dropout_top(gt_boxes, points, intensity_range):
     return gt_boxes, points
 
 
-def global_frustum_dropout_bottom(gt_boxes, points, intensity_range):
+def global_frustum_dropout_bottom(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -241,7 +277,10 @@ def global_frustum_dropout_bottom(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
-    intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+    if rng is None:
+        rng = np.random.default_rng()
+    
+    intensity = rng.uniform(intensity_range[0], intensity_range[1])
     
     threshold = np.min(points[:, 2]) + intensity * (np.max(points[:, 2]) - np.min(points[:, 2]))
     points = points[points[:, 2] > threshold]
@@ -250,7 +289,7 @@ def global_frustum_dropout_bottom(gt_boxes, points, intensity_range):
     return gt_boxes, points
 
 
-def global_frustum_dropout_left(gt_boxes, points, intensity_range):
+def global_frustum_dropout_left(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -258,7 +297,11 @@ def global_frustum_dropout_left(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
-    intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+
+    if rng is None:
+        rng = np.random.default_rng()
+
+    intensity = rng.uniform(intensity_range[0], intensity_range[1])
     
     threshold = np.max(points[:, 1]) - intensity * (np.max(points[:, 1]) - np.min(points[:, 1]))
     points = points[points[:, 1] < threshold]
@@ -267,7 +310,7 @@ def global_frustum_dropout_left(gt_boxes, points, intensity_range):
     return gt_boxes, points
 
 
-def global_frustum_dropout_right(gt_boxes, points, intensity_range):
+def global_frustum_dropout_right(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -275,7 +318,10 @@ def global_frustum_dropout_right(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
-    intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+    if rng is None:
+        rng = np.random.default_rng()
+    
+    intensity = rng.uniform(intensity_range[0], intensity_range[1])
     
     threshold = np.min(points[:, 1]) + intensity * (np.max(points[:, 1]) - np.min(points[:, 1]))
     points = points[points[:, 1] > threshold]
@@ -284,7 +330,7 @@ def global_frustum_dropout_right(gt_boxes, points, intensity_range):
     return gt_boxes, points
 
 
-def local_scaling(gt_boxes, points, scale_range):
+def local_scaling(gt_boxes, points, scale_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading]
@@ -292,12 +338,15 @@ def local_scaling(gt_boxes, points, scale_range):
         scale_range: [min, max]
     Returns:
     """
+    if rng is None:
+        rng = np.random.default_rng()
+    
     if scale_range[1] - scale_range[0] < 1e-3:
         return gt_boxes, points
     
     # augs = {}
     for idx, box in enumerate(gt_boxes):
-        noise_scale = np.random.uniform(scale_range[0], scale_range[1])
+        noise_scale = rng.uniform(scale_range[0], scale_range[1])
         # augs[f'object_{idx}'] = noise_scale
         points_in_box, mask = get_points_in_box(points, box)
         
@@ -318,7 +367,7 @@ def local_scaling(gt_boxes, points, scale_range):
     return gt_boxes, points
 
 
-def local_rotation(gt_boxes, points, rot_range):
+def local_rotation(gt_boxes, points, rot_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]]
@@ -326,9 +375,12 @@ def local_rotation(gt_boxes, points, rot_range):
         rot_range: [min, max]
     Returns:
     """
+
+    if rng is None:
+        rng = np.random.default_rng()
     # augs = {}
     for idx, box in enumerate(gt_boxes):
-        noise_rotation = np.random.uniform(rot_range[0], rot_range[1])
+        noise_rotation = rng.uniform(rot_range[0], rot_range[1])
         # augs[f'object_{idx}'] = noise_rotation
         points_in_box, mask = get_points_in_box(points, box)
         
@@ -366,7 +418,7 @@ def local_rotation(gt_boxes, points, rot_range):
     return gt_boxes, points
 
 
-def local_frustum_dropout_top(gt_boxes, points, intensity_range):
+def local_frustum_dropout_top(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -374,10 +426,13 @@ def local_frustum_dropout_top(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
+    if rng is None:
+        rng = np.random.default_rng()
+    
     for idx, box in enumerate(gt_boxes):
         x, y, z, dx, dy, dz = box[0], box[1], box[2], box[3], box[4], box[5]
         
-        intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+        intensity = rng.uniform(intensity_range[0], intensity_range[1])
         points_in_box, mask = get_points_in_box(points, box)
         threshold = (z + dz / 2) - intensity * dz
         
@@ -386,7 +441,7 @@ def local_frustum_dropout_top(gt_boxes, points, intensity_range):
     return gt_boxes, points
 
 
-def local_frustum_dropout_bottom(gt_boxes, points, intensity_range):
+def local_frustum_dropout_bottom(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -394,10 +449,14 @@ def local_frustum_dropout_bottom(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
+    
+    if rng is None:
+        rng = np.random.default_rng()
+    
     for idx, box in enumerate(gt_boxes):
         x, y, z, dx, dy, dz = box[0], box[1], box[2], box[3], box[4], box[5]
         
-        intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+        intensity = rng.uniform(intensity_range[0], intensity_range[1])
         points_in_box, mask = get_points_in_box(points, box)
         threshold = (z - dz / 2) + intensity * dz
         
@@ -406,7 +465,7 @@ def local_frustum_dropout_bottom(gt_boxes, points, intensity_range):
     return gt_boxes, points
 
 
-def local_frustum_dropout_left(gt_boxes, points, intensity_range):
+def local_frustum_dropout_left(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -414,10 +473,13 @@ def local_frustum_dropout_left(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
+    if rng is None:
+        rng = np.random.default_rng()
+    
     for idx, box in enumerate(gt_boxes):
         x, y, z, dx, dy, dz = box[0], box[1], box[2], box[3], box[4], box[5]
         
-        intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+        intensity = rng.uniform(intensity_range[0], intensity_range[1])
         points_in_box, mask = get_points_in_box(points, box)
         threshold = (y + dy / 2) - intensity * dy
         
@@ -426,7 +488,7 @@ def local_frustum_dropout_left(gt_boxes, points, intensity_range):
     return gt_boxes, points
 
 
-def local_frustum_dropout_right(gt_boxes, points, intensity_range):
+def local_frustum_dropout_right(gt_boxes, points, intensity_range, rng = None):
     """
     Args:
         gt_boxes: (N, 7), [x, y, z, dx, dy, dz, heading, [vx], [vy]],
@@ -434,10 +496,14 @@ def local_frustum_dropout_right(gt_boxes, points, intensity_range):
         intensity: [min, max]
     Returns:
     """
+    
+    if rng is None:
+        rng = np.random.default_rng()
+    
     for idx, box in enumerate(gt_boxes):
         x, y, z, dx, dy, dz = box[0], box[1], box[2], box[3], box[4], box[5]
         
-        intensity = np.random.uniform(intensity_range[0], intensity_range[1])
+        intensity = rng.uniform(intensity_range[0], intensity_range[1])
         points_in_box, mask = get_points_in_box(points, box)
         threshold = (y - dy / 2) + intensity * dy
         
@@ -507,12 +573,16 @@ def points_in_pyramids_mask(points, pyramids):
     return flags
 
 
-def local_pyramid_dropout(gt_boxes, points, dropout_prob, pyramids=None):
+def local_pyramid_dropout(gt_boxes, points, dropout_prob, pyramids=None, rng = None):
+    
+    if rng is None:
+        rng = np.random.default_rng()
+
     if pyramids is None:
         pyramids = get_pyramids(gt_boxes).reshape([-1, 6, 5, 3])  # each six surface of boxes: [num_boxes, 6, 15=3*5]
-    drop_pyramid_indices = np.random.randint(0, 6, (pyramids.shape[0]))
+    drop_pyramid_indices = rng.randint(0, 6, (pyramids.shape[0]))
     drop_pyramid_one_hot = one_hot(drop_pyramid_indices, num_class=6)
-    drop_box_mask = np.random.uniform(0, 1, (pyramids.shape[0])) <= dropout_prob
+    drop_box_mask = rng.uniform(0, 1, (pyramids.shape[0])) <= dropout_prob
     if np.sum(drop_box_mask) != 0:
         drop_pyramid_mask = (np.tile(drop_box_mask[:, None], [1, 6]) * drop_pyramid_one_hot) > 0
         drop_pyramids = pyramids[drop_pyramid_mask]
@@ -523,14 +593,18 @@ def local_pyramid_dropout(gt_boxes, points, dropout_prob, pyramids=None):
     return gt_boxes, points, pyramids
 
 
-def local_pyramid_sparsify(gt_boxes, points, prob, max_num_pts, pyramids=None):
+def local_pyramid_sparsify(gt_boxes, points, prob, max_num_pts, pyramids=None, rng = None):
+    
+    if rng is None:
+        rng = np.random.default_rng()
+    
     if pyramids is None:
         pyramids = get_pyramids(gt_boxes).reshape([-1, 6, 5, 3])  # each six surface of boxes: [num_boxes, 6, 15=3*5]
     if pyramids.shape[0] > 0:
         sparsity_prob, sparsity_num = prob, max_num_pts
-        sparsify_pyramid_indices = np.random.randint(0, 6, (pyramids.shape[0]))
+        sparsify_pyramid_indices = rng.randint(0, 6, (pyramids.shape[0]))
         sparsify_pyramid_one_hot = one_hot(sparsify_pyramid_indices, num_class=6)
-        sparsify_box_mask = np.random.uniform(0, 1, (pyramids.shape[0])) <= sparsity_prob
+        sparsify_box_mask = rng.uniform(0, 1, (pyramids.shape[0])) <= sparsity_prob
         sparsify_pyramid_mask = (np.tile(sparsify_box_mask[:, None], [1, 6]) * sparsify_pyramid_one_hot) > 0
         # print(sparsify_box_mask)
         
@@ -549,7 +623,7 @@ def local_pyramid_sparsify(gt_boxes, points, prob, max_num_pts, pyramids=None):
             
             sparsified_points = []
             for sample in to_sparsify_points:
-                sampled_indices = np.random.choice(sample.shape[0], size=sparsity_num, replace=False)
+                sampled_indices = rng.choice(sample.shape[0], size=sparsity_num, replace=False)
                 sparsified_points.append(sample[sampled_indices])
             sparsified_points = np.concatenate(sparsified_points, axis=0)
             points = np.concatenate([remain_points, sparsified_points], axis=0)
@@ -557,7 +631,11 @@ def local_pyramid_sparsify(gt_boxes, points, prob, max_num_pts, pyramids=None):
     return gt_boxes, points, pyramids
 
 
-def local_pyramid_swap(gt_boxes, points, prob, max_num_pts, pyramids=None):
+def local_pyramid_swap(gt_boxes, points, prob, max_num_pts, pyramids=None, rng = None):
+
+    if rng is None:
+        rng = np.random.default_rng()
+    
     def get_points_ratio(points, pyramid):
         surface_center = (pyramid[3:6] + pyramid[6:9] + pyramid[9:12] + pyramid[12:]) / 4.0
         vector_0, vector_1, vector_2 = pyramid[6:9] - pyramid[3:6], pyramid[12:] - pyramid[3:6], pyramid[0:3] - surface_center
@@ -580,7 +658,7 @@ def local_pyramid_swap(gt_boxes, points, prob, max_num_pts, pyramids=None):
     if pyramids is None:
         pyramids = get_pyramids(gt_boxes).reshape([-1, 6, 5, 3])  # each six surface of boxes: [num_boxes, 6, 15=3*5]
     swap_prob, num_thres = prob, max_num_pts
-    swap_pyramid_mask = np.random.uniform(0, 1, (pyramids.shape[0])) <= swap_prob
+    swap_pyramid_mask = rng.uniform(0, 1, (pyramids.shape[0])) <= swap_prob
     
     if swap_pyramid_mask.sum() > 0:
         point_masks = points_in_pyramids_mask(points, pyramids)
@@ -592,7 +670,7 @@ def local_pyramid_swap(gt_boxes, points, prob, max_num_pts, pyramids=None):
         if selected_pyramids.sum() > 0:
             # get to_swap pyramids
             index_i, index_j = np.nonzero(selected_pyramids)
-            selected_pyramid_indices = [np.random.choice(index_j[index_i == i]) \
+            selected_pyramid_indices = [rng.choice(index_j[index_i == i]) \
                                             if e and (index_i == i).any() else 0 for i, e in
                                         enumerate(swap_pyramid_mask)]
             selected_pyramids_mask = selected_pyramids * one_hot(selected_pyramid_indices, num_class=6) == 1
@@ -601,7 +679,7 @@ def local_pyramid_swap(gt_boxes, points, prob, max_num_pts, pyramids=None):
             # get swapped pyramids
             index_i, index_j = np.nonzero(selected_pyramids_mask)
             non_zero_pyramids_mask[selected_pyramids_mask] = False
-            swapped_index_i = np.array([np.random.choice(np.where(non_zero_pyramids_mask[:, j])[0]) if \
+            swapped_index_i = np.array([rng.choice(np.where(non_zero_pyramids_mask[:, j])[0]) if \
                                             np.where(non_zero_pyramids_mask[:, j])[0].shape[0] > 0 else
                                         index_i[i] for i, j in enumerate(index_j.tolist())])
             swapped_indicies = np.concatenate([swapped_index_i[:, None], index_j[:, None]], axis=1)
