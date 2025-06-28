@@ -127,6 +127,8 @@ def main():
     if args.sync_bn:
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model)
     model.cuda()
+    
+    # params = [name for (name, param) in model.named_parameters() if param.requires_grad is True]
 
     optimizer = build_optimizer(model, cfg.OPTIMIZATION)
 

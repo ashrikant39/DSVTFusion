@@ -13,7 +13,7 @@ from .mppnet import MPPNet
 from .mppnet_e2e import MPPNetE2E
 from .CT3D import CT3D
 from .CT3D_3CAT import CT3D_3CAT
-from .transfusion import TransFusion, TransfusionWrapper, TransFusionTemporalModel
+from .transfusion import TransFusion, TransfusionWrapper, TransFusionTemporalFullSweepBoxModel
 
 __all__ = {
     'Detector3DTemplate': Detector3DTemplate,
@@ -33,7 +33,7 @@ __all__ = {
     'CT3D_3CAT': CT3D_3CAT,
     'TransFusion': TransFusion,
     'TransfusionWrapper':TransfusionWrapper,
-    'TransFusionTemporalModel': TransFusionTemporalModel
+    'TransFusionTemporalFullSweepBoxModel': TransFusionTemporalFullSweepBoxModel
 }
 
 

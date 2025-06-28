@@ -127,7 +127,7 @@ class DataBaseSampler(object):
 
         return db_infos
 
-    def sample_with_fixed_number(self, class_name, sample_group):
+    def sample_with_fixed_number(self, class_name, sample_group, rng = None):
         """
         Args:
             class_name:
@@ -135,9 +135,12 @@ class DataBaseSampler(object):
         Returns:
 
         """
+        if rng is None:
+            rng = np.random.default_rng()
+
         sample_num, pointer, indices = int(sample_group['sample_num']), sample_group['pointer'], sample_group['indices']
         if pointer >= len(self.db_infos[class_name]):
-            indices = np.random.permutation(len(self.db_infos[class_name]))
+            indices = rng.permutation(len(self.db_infos[class_name]))
             pointer = 0
 
         sampled_dict = [self.db_infos[class_name][idx] for idx in indices[pointer: pointer + sample_num]]
@@ -446,7 +449,7 @@ class DataBaseSampler(object):
 
         return data_dict
 
-    def __call__(self, data_dict):
+    def __call__(self, data_dict, rng = None):
         """
         Args:
             data_dict:
@@ -467,7 +470,7 @@ class DataBaseSampler(object):
                 num_gt = np.sum(class_name == gt_names)
                 sample_group['sample_num'] = str(int(self.sample_class_num[class_name]) - num_gt)
             if int(sample_group['sample_num']) > 0:
-                sampled_dict = self.sample_with_fixed_number(class_name, sample_group)
+                sampled_dict = self.sample_with_fixed_number(class_name, sample_group, rng = rng)
 
                 sampled_boxes = np.stack([x['box3d_lidar'] for x in sampled_dict], axis=0).astype(np.float32)
 

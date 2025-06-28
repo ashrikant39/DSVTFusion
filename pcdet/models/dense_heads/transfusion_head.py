@@ -11,7 +11,7 @@ from .target_assigner.hungarian_assigner import HungarianAssigner3D
 from ...utils import loss_utils
 from ..model_utils import centernet_utils
 from ..model_utils import model_nms_utils
-
+import pdb
 
 class SeparateHead_Transfusion(nn.Module):
     def __init__(self, input_channels, head_channels, kernel_size, sep_head_dict, init_bias=-2.19, use_bias=False):
@@ -459,7 +459,16 @@ class TransFusionHead(nn.Module):
         return targets
 
     def decode_bbox(self, heatmap, rot, dim, center, height, vel, filter=False):
-        
+        """
+        These ops are done per example
+        heatmap -> (1, 10, 200)
+        rot     -> (1, 2, 200)
+        dim     -> (1, 3, 200)
+        center  -> (1, 2, 200)
+        height  -> (1, 1, 200)
+        vel     -> (1, 2, 200)
+
+        """
         post_process_cfg = self.model_cfg.POST_PROCESSING
         score_thresh = post_process_cfg.SCORE_THRESH
         post_center_range = post_process_cfg.POST_CENTER_RANGE

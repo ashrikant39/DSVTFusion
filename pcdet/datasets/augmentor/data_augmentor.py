@@ -117,6 +117,10 @@ class DataAugmentor(object):
         return data_dict
 
     def random_world_translation(self, data_dict=None, config=None, rng = None):
+
+        if rng is None:
+            rng = np.random.default_rng()
+
         if data_dict is None:
             return partial(self.random_world_translation, config=config, rng = rng)
         noise_translate_std = config['NOISE_TRANSLATE_STD']
@@ -259,7 +263,12 @@ class DataAugmentor(object):
 
         Returns:
         """
+
         for cur_augmentor in self.data_augmentor_queue:
+            # print(self.data_augmentor_queue)
+            # print()
+            # print(cur_augmentor)
+            # import pdb; pdb.set_trace()
             data_dict = cur_augmentor(data_dict=data_dict, rng = rng)
 
         data_dict['gt_boxes'][:, 6] = common_utils.limit_period(

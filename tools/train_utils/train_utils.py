@@ -1,5 +1,6 @@
 import glob
 import os
+import pdb
 
 import torch
 import tqdm
@@ -8,6 +9,7 @@ import contextlib
 
 from torch.nn.utils import clip_grad_norm_
 from pcdet.utils import common_utils, commu_utils
+from pcdet.models.detectors.transfusion import TemporalBoxDecoder
 
 try:
     import torch.cuda.amp
@@ -53,18 +55,23 @@ def nan_hook(module, input, output):
 
 
 def nan_backward_hook(module, grad_input, grad_output):
-    with open("/home/ashri/DSVT/work_dirs/isnan_file_backward.txt", 'a') as fp:
+    with open("/home/ashri/DSVT/work_dirs/backward.txt", 'a') as fp:
+        
         for i, g_in in enumerate(grad_input):
-            if isinstance(g_in, torch.Tensor) and torch.isnan(g_in).any():
-                print(f"{module.__class__.__name__} grad_input[{i}] has NaNs", file=fp)
-
+            if g_in is not None:
+                print(f"{module.__class__.__name__} grad_input[{i}] Norm: {torch.norm(g_in)}, Shape: {g_in.shape}", file=fp)
+        
         for i, g_out in enumerate(grad_output):
-            if isinstance(g_out, torch.Tensor) and torch.isnan(g_out).any():
-                print(f"{module.__class__.__name__} grad_output[{i}] has NaNs", file=fp)
+            if g_out is not None:
+                print(f"{module.__class__.__name__} grad_input[{i}] Norm: {torch.norm(g_out)}, Shape: {g_out.shape}", file=fp)
+        
+        # for i, g_out in enumerate(grad_output):
+        #     if isinstance(g_out, torch.Tensor) and torch.isnan(g_out).any():
+        #         print(f"{module.__class__.__name__} grad_output[{i}] has NaNs", file=fp)
 
-        for name, param in module.named_parameters(recurse=False):
-            if param.grad is not None and torch.isnan(param.grad).any():
-                print(f"{module.__class__.__name__} param '{name}' grad has NaNs", file=fp)
+        # for name, param in module.named_parameters(recurse=False):
+        #     if param.grad is not None and torch.isnan(param.grad).any():
+        #         print(f"{module.__class__.__name__} param '{name}' grad has NaNs", file=fp)
 
 
 def grad_hook(module, input, output):
@@ -114,13 +121,15 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
         amp_ctx = torch.cuda.amp.autocast(dtype=torch.bfloat16)
 
     end = time.time()
+
+    batch = next(dataloader_iter)
     for cur_it in range(start_it, total_it_each_epoch):
-        try:
-            batch = next(dataloader_iter)
-        except StopIteration:
-            dataloader_iter = iter(train_loader)
-            batch = next(dataloader_iter)
-            print('new iters')
+        # try:
+        #     batch = next(dataloader_iter)
+        # except StopIteration:
+        #     dataloader_iter = iter(train_loader)
+        #     batch = next(dataloader_iter)
+        #     print('new iters')
 
         data_timer = time.time()
         cur_data_time = data_timer - end
@@ -140,7 +149,6 @@ def train_one_epoch(model, optimizer, train_loader, model_func, lr_scheduler, ac
 
         with amp_ctx:
             loss, tb_dict, disp_dict = model_func(model, batch)
-            
             if fp16:
                 assert loss.dtype is torch.float32
                 scaler.scale(loss).backward()
@@ -250,8 +258,10 @@ def train_model(model, optimizer, train_loader, model_func, lr_scheduler, optim_
                 use_logger_to_record=False, logger=None, logger_iter_interval=None, ckpt_save_time_interval=None, show_gpu_stat=False, fp16=False, cfg=None):
     accumulated_iter = start_iter   
         
-    # for module in model.modules():
-    #     module.register_full_backward_hook(nan_backward_hook)
+    for module in model.modules():
+        
+        if isinstance(module, TemporalBoxDecoder):
+            module.register_full_backward_hook(nan_backward_hook)
         
     augment_disable_flag = False
     with tqdm.trange(start_epoch, total_epochs, desc='epochs', dynamic_ncols=True, leave=(rank == 0)) as tbar:

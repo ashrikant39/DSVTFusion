@@ -1,3 +1,4 @@
+import pdb
 import torch
 from scipy.optimize import linear_sum_assignment
 from pcdet.ops.iou3d_nms import iou3d_nms_cuda
@@ -63,7 +64,7 @@ class HungarianAssigner3D:
         alpha = self.cls_cost.get('alpha', 0.25)
         gamma = self.cls_cost.get('gamma', 2.0)
         eps = self.cls_cost.get('eps', 1e-12)
-
+        
         cls_pred = cls_pred.sigmoid()
         neg_cost = -(1 - cls_pred + eps).log() * (
             1 - alpha) * cls_pred.pow(gamma)
@@ -91,8 +92,14 @@ class HungarianAssigner3D:
         return iou_cost * weight, iou
 
     def assign(self, bboxes, gt_bboxes, gt_labels, cls_pred, point_cloud_range):
-        num_gts, num_bboxes = gt_bboxes.size(0), bboxes.size(0)
+        """
+        bboxes -> (num_boxes, 9)
+        gt_boxes -> (num_gts, 9)
+        gt_labels -> (num_gts)
+        cls_pred -> (1, num_classes, num_boxes)
 
+        """
+        num_gts, num_bboxes = gt_bboxes.size(0), bboxes.size(0)
         # 1. assign -1 by default
         assigned_gt_inds = bboxes.new_full((num_bboxes,), -1, dtype=torch.long)
         assigned_labels = bboxes.new_full((num_bboxes,), -1, dtype=torch.long)

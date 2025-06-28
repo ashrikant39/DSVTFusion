@@ -3,12 +3,74 @@ import pickle
 from pathlib import Path
 
 import numpy as np
+from torch.utils import data
 from tqdm import tqdm
 
 from ...ops.roiaware_pool3d import roiaware_pool3d_utils
 from ...utils import common_utils
 from ..dataset import DatasetTemplate
 
+
+def invert_affine_matrix(T: np.ndarray) -> np.ndarray:
+    """
+    Efficiently invert a 4x4 affine matrix (rotation + translation).
+    Assumes bottom row is [0, 0, 0, 1]
+    """
+    R = T[:3, :3]
+    t = T[:3, 3]
+    
+    R_inv = R.T
+    t_inv = -R_inv @ t
+    
+    T_inv = np.eye(4)
+    T_inv[:3, :3] = R_inv
+    T_inv[:3, 3] = t_inv
+    
+    return T_inv
+
+
+def apply_affine_to_boxes(boxes: np.ndarray, T: np.ndarray) -> np.ndarray:
+    """
+    Apply a 4x4 affine transform to boxes of shape (N, 10) with format:
+    [x, y, z, l, w, h, yaw, vx, vy, class_label]
+    Only position, yaw, and velocity are transformed.
+    """
+    transformed_boxes = boxes.copy()
+    
+    # 1. Transform center (x, y, z)
+    centers = boxes[:, 0:3]  # (N, 3)
+    centers_hom = np.hstack([centers, np.ones((len(centers), 1))])  # (N, 4)
+    transformed_centers = (T @ centers_hom.T).T[:, :3]
+    transformed_boxes[:, 0:3] = transformed_centers
+
+    # 2. Size (l, w, h) remains unchanged
+
+    # 3. Transform yaw (assuming rotation is around Z)
+    R = T[:3, :3]
+    # Extract yaw rotation from affine transform
+    delta_yaw = np.arctan2(R[1, 0], R[0, 0])  # Only works if rotation is in XY plane
+    transformed_boxes[:, 6] = boxes[:, 6] + delta_yaw  # new_yaw = old_yaw + delta_yaw
+
+    # 4. Transform velocity (vx, vy)
+    velocities = boxes[:, 7:9]  # (N, 2)
+    vel_3d = np.hstack([velocities, np.zeros((len(velocities), 1))])  # (N, 3)
+    rotated_vel = (R @ vel_3d.T).T[:, :2]  # Apply R, keep XY
+    transformed_boxes[:, 7:9] = rotated_vel
+
+    # 5. class_label remains unchanged
+
+    return transformed_boxes
+
+
+
+# def rotate(self, quaternion: Quaternion) -> None:
+#         """
+#         Rotates box.
+#         :param quaternion: Rotation to apply.
+#         """
+#         self.center = np.dot(quaternion.rotation_matrix, self.center)
+#         self.orientation = quaternion * self.orientation
+#         self.velocity = np.dot(quaternion.rotation_matrix, self.velocity)
 
 class NuScenesDataset(DatasetTemplate):
     def __init__(self, dataset_cfg, class_names, training=True, root_path=None, logger=None):
@@ -316,6 +378,7 @@ class NuScenesTemporalDataset(DatasetTemplate):
         return sampled_infos
 
     def get_sweep(self, sweep_info):
+        
         def remove_ego_points(points, center_radius=1.0):
             mask = ~((np.abs(points[:, 0]) < center_radius) & (np.abs(points[:, 1]) < center_radius))
             return points[mask]
@@ -323,10 +386,10 @@ class NuScenesTemporalDataset(DatasetTemplate):
         lidar_path = self.root_path / sweep_info['lidar_path']
         points_sweep = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
         points_sweep = remove_ego_points(points_sweep).T
-        if sweep_info['transform_matrix'] is not None:
-            num_points = points_sweep.shape[1]
-            points_sweep[:3, :] = sweep_info['transform_matrix'].dot(
-                np.vstack((points_sweep[:3, :], np.ones(num_points))))[:3, :]
+        # if sweep_info['transform_matrix'] is not None:
+        #     num_points = points_sweep.shape[1]
+        #     points_sweep[:3, :] = sweep_info['transform_matrix'].dot(
+        #         np.vstack((points_sweep[:3, :], np.ones(num_points))))[:3, :]
 
         cur_times = sweep_info['time_lag'] * np.ones((1, points_sweep.shape[1]))
         return points_sweep.T, cur_times.T
@@ -334,24 +397,29 @@ class NuScenesTemporalDataset(DatasetTemplate):
     def get_lidar_with_sweeps(self, index, max_sweeps=1):
         info = self.infos[index]
         lidar_path = self.root_path / info['lidar_path']
+
         points = np.fromfile(str(lidar_path), dtype=np.float32, count=-1).reshape([-1, 5])[:, :4]
-
-        sweep_points_list = [points]
-        prev_points, times_sweep = self.get_sweep(info['sweeps'][1])
-        
-        sweep_times_list = [np.zeros((points.shape[0], 1))]
-
-        # for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False):
-        #     points_sweep, times_sweep = self.get_sweep(info['sweeps'][k])
-        #     sweep_points_list.append(points_sweep)
-        #     sweep_times_list.append(times_sweep)
-        points = np.concatenate(sweep_points_list, axis=0)
-        times = np.concatenate(sweep_times_list, axis=0).astype(points.dtype)
-
+        times = np.zeros((points.shape[0], 1)) 
         points = np.concatenate((points, times), axis=1)
-        prev_points = np.concatenate((prev_points, times_sweep), axis=1)
+
+        sweep_points_list = []
+        transform_matrices = []
+        # prev_points, times_sweep = self.get_sweep(info['sweeps'][1])
+
+        for k in np.random.choice(len(info['sweeps']), max_sweeps - 1, replace=False):
+            points_sweep, times_sweep = self.get_sweep(info['sweeps'][k])
+            transform = info['sweeps'][k]['transform_matrix']
+            points_sweep = np.concatenate((points_sweep, times_sweep), axis=1)
+            sweep_points_list.append(points_sweep)
+            transform_matrices.append(transform)
         
-        return points, prev_points
+        # points = np.concatenate(sweep_points_list, axis=0)
+        # times = np.concatenate(sweep_times_list, axis=0).astype(points.dtype)
+
+        # points = np.concatenate((points, times), axis=1)
+        # prev_points = np.concatenate((prev_points, times_sweep), axis=1)
+        
+        return points, sweep_points_list, transform_matrices
 
     def __len__(self):
         if self._merge_all_iters_to_one_epoch:
@@ -364,21 +432,16 @@ class NuScenesTemporalDataset(DatasetTemplate):
             index = index % len(self.infos)
 
         info = copy.deepcopy(self.infos[index])
-        points, prev_points = self.get_lidar_with_sweeps(index, max_sweeps=self.dataset_cfg.MAX_SWEEPS)
+        points, sweep_points_list, transform_matrices = self.get_lidar_with_sweeps(index, max_sweeps=self.dataset_cfg.MAX_SWEEPS)
+        
+        sweep_box_list = []
 
         input_dict = {
             'points': points,
             'frame_id': Path(info['lidar_path']).stem,
             'metadata': {'token': info['token']}
         }
-
-        prev_dict = {
-            'points': prev_points,
-            'frame_id':  Path(info['lidar_path']).stem,
-            'metadata': {'token': info['token']}
-        }
-
-
+        
         if 'gt_boxes' in info:
             if self.dataset_cfg.get('FILTER_MIN_POINTS_IN_GT', False):
                 mask = (info['num_lidar_pts'] > self.dataset_cfg.FILTER_MIN_POINTS_IN_GT - 1)
@@ -390,29 +453,51 @@ class NuScenesTemporalDataset(DatasetTemplate):
                 'gt_boxes': info['gt_boxes'] if mask is None else info['gt_boxes'][mask]
             })
             
-            prev_dict.update({
-                'gt_names': info['gt_names'] if mask is None else info['gt_names'][mask],
-                'gt_boxes': info['gt_boxes'] if mask is None else info['gt_boxes'][mask]
-            })
-        
+            for transform in transform_matrices:
+                inv_tranform = invert_affine_matrix(transform)
+                translated_gt_box = apply_affine_to_boxes(info['gt_boxes'] if mask is None else info['gt_boxes'][mask], inv_tranform)
+                sweep_box_list.append(translated_gt_box)
+                    
         random_seed = np.random.randint(0, 100000)
-        np.random.seed(random_seed)
-        data_dict = self.prepare_data(data_dict=input_dict)
+        rng = np.random.RandomState(random_seed)
+        data_dict = self.prepare_data(data_dict=input_dict, rng=rng)
         
-        np.random.seed(random_seed)
-        prev_dict = self.prepare_data(data_dict=prev_dict)
-        data_dict['prev_points'] = prev_dict['points']
+        input_dict_copy = copy.deepcopy(input_dict)
+        
+        for idx, sweep_points in enumerate(sweep_points_list):
 
-        del prev_dict
+            random_seed = np.random.randint(0, 100000)
+            rng = np.random.RandomState(random_seed)
+
+            input_dict_copy['points'] = sweep_points
+            input_dict_copy['gt_boxes'] = sweep_box_list[idx]
+
+            data_dict_copy = self.prepare_data(data_dict=input_dict_copy, rng=rng)    
+            
+            data_dict[f'points_{idx + 1}'] = data_dict_copy['points']
+            data_dict[f'gt_boxes_{idx + 1}'] = data_dict_copy['gt_boxes']
+            data_dict[f'transform_{idx + 1}'] = transform_matrices[idx]
 
         if self.dataset_cfg.get('SET_NAN_VELOCITY_TO_ZEROS', False):
             gt_boxes = data_dict['gt_boxes']
             gt_boxes[np.isnan(gt_boxes)] = 0
             data_dict['gt_boxes'] = gt_boxes
+        
 
         if not self.dataset_cfg.PRED_VELOCITY and 'gt_boxes' in data_dict:
             data_dict['gt_boxes'] = data_dict['gt_boxes'][:, [0, 1, 2, 3, 4, 5, 6, -1]]
 
+        for idx in range(len(sweep_box_list)):
+                
+            if self.dataset_cfg.get('SET_NAN_VELOCITY_TO_ZEROS', False):    
+
+                translated_box = data_dict[f'gt_boxes_{idx + 1}']
+                translated_box[np.isnan(translated_box)] = 0
+                data_dict[f'gt_boxes_{idx + 1}'] = translated_box
+
+            if not self.dataset_cfg.PRED_VELOCITY and 'gt_boxes' in data_dict:
+                data_dict[f'gt_boxes_{idx + 1}'] = data_dict[f'gt_boxes_{idx + 1}'][:, [0, 1, 2, 3, 4, 5, 6, -1]]
+        
         return data_dict
 
     def evaluation(self, det_annos, class_names, **kwargs):
@@ -530,7 +615,7 @@ class NuScenesFullSweepTemporalDataset(NuScenesDataset):
     
 
     def load_data(self, index, rng = None):
-
+        
         if self._merge_all_iters_to_one_epoch:
             index = index % len(self.infos)
 
@@ -574,8 +659,23 @@ class NuScenesFullSweepTemporalDataset(NuScenesDataset):
         random_seed = np.random.randint(0, 100000) 
         rng = np.random.RandomState(random_seed)
         
+
+        if index < self.num_timesteps:
+            if self.training:
+                index = np.random.randint(self.num_timesteps, self.__len__())
+            else:
+                data_dict = self.load_data(index)
+                
+                for shift_idx in range(1, self.num_timesteps + 1):
+                    data_dict[f'points_{shift_idx}'] = np.zeros_like(data_dict['points'])
+                    data_dict[f'gt_boxes_{shift_idx}'] = np.zeros_like(data_dict['gt_boxes'])
+                
+                data_dict['prev_data_present'] = False
+
+                return data_dict
+
         # t = t
-        data_dict = self.load_data(index + self.num_timesteps, rng=rng)
+        data_dict = self.load_data(index, rng=rng)
         # ['points', 'frame_id', 'metadata', 'gt_boxes', 'flip_x', 'flip_y', 'noise_rot', 'noise_scale', 'use_lead_xyz']
         # points -> (N, 5)
         # frame_id -> str
@@ -583,22 +683,21 @@ class NuScenesFullSweepTemporalDataset(NuScenesDataset):
         # gt_boxes -> (Nb, 10)
         # flip_x, flip_y, use_lead_xyz -> bool
         # noise_rot, noise_scale -> float values
-        
-        data_dict['prev_points'] = []
-        data_dict['prev_boxes'] = []
 
         # t = t-1, t-2, .., t-self.num_timesteps in reverse order
 
-        for shift_idx in range(self.num_timesteps):    
-            prev_data = self.load_data(index + shift_idx, rng = rng)
-            data_dict['prev_points'].append(prev_data['points'])
-            data_dict['prev_boxes'].append(prev_data['gt_boxes'])
-
+        for shift_idx in range(1, self.num_timesteps + 1):    
+            rng = np.random.RandomState(random_seed)
+            prev_data = self.load_data(index - shift_idx, rng = rng)
+            data_dict[f"points_{shift_idx}"] = prev_data['points']
+            data_dict[f"gt_boxes_{shift_idx}"] = prev_data['gt_boxes'] 
+        
+        data_dict['prev_data_present'] = True
         return data_dict
     
 
     def __len__(self):
-        return super().__len__() - self.num_timesteps
+        return super().__len__()
 
 
 

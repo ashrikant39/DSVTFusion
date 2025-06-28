@@ -1,11 +1,73 @@
-from torch.utils.checkpoint import checkpoint
 from .detector3d_template import Detector3DTemplate
-import torch
+import torch, torch.nn.functional as F
 import torch.nn as nn
 import os
 from ...utils.spconv_utils import find_all_spconv_keys
 import math
 from einops import rearrange
+from ..dense_heads.target_assigner.hungarian_assigner import HungarianAssigner3D
+import pdb
+from pcdet.ops.iou3d_nms.iou3d_nms_utils import boxes_iou3d_and_union_gpu
+from pcdet.utils.box_utils import boxes_to_corners_3d
+from pcdet.utils.loss_utils import SigmoidFocalClassificationLoss
+
+
+def focal_loss(logits, targets, alpha=0.25, gamma=2.0):
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    pt = torch.exp(-bce)
+    loss = alpha * (1 - pt) ** gamma * bce
+    return loss.mean()
+
+
+
+def encode_bbox(bboxes, pcd_range):
+    
+    # [x, y, z, w, l, h, yaw, vx, vy, class_id]
+    # output_dir
+    # [x, y, z, logw, logl, logh, sin yaw, cos yaw, vx, vy]
+    box_dims = bboxes.shape
+    targets = torch.zeros([*box_dims[:-1], 10]).to(bboxes)
+
+    targets[..., :3] = (bboxes[..., :3] - pcd_range[:3])/(pcd_range[3:] - pcd_range[:3]) # xyz
+    targets[..., 3:6] = bboxes[..., 3:6].log() # lwh
+    targets[..., 6] = torch.sin(bboxes[..., 6]) # sin yaw
+    targets[..., 7] = torch.cos(bboxes[..., 6]) # cos yaw
+    targets[..., 8:10] = bboxes[..., 7:9] # vx, vy
+    
+    return targets
+
+
+
+def decode_bbox(bboxes, pcd_range):
+    
+    # [x, y, z, log w, log l, log h, sin yaw, cos yaw, vx, vy]
+    
+    xyz = bboxes[..., :3] * (pcd_range[3:] - pcd_range[:3]) + pcd_range[:3] # xyz
+    lwh = bboxes[..., 3:6].exp() # lwh
+    yaw = torch.atan2(bboxes[..., 6:7], bboxes[..., 7:8]) # sin yaw
+    velocity = bboxes[..., 8:10] # vx, vy    
+
+    return torch.cat([xyz, lwh, yaw, velocity], dim=-1)
+
+
+
+def calculate_generalized_iou3d(pred_boxes, gt_boxes):
+    """
+    boxes of shape (N, 7)
+    """
+    iou, union = boxes_iou3d_and_union_gpu(pred_boxes, gt_boxes)
+
+    pred_corners = boxes_to_corners_3d(pred_boxes)
+    gt_corners = boxes_to_corners_3d(gt_boxes)
+    corners = torch.cat([pred_corners, gt_corners], dim=1)
+
+    enclosing_min = corners.min(dim=1).values
+    enclosing_max = corners.max(dim=1).values
+
+    dims = enclosing_min - enclosing_max
+    enclosing_vol = torch.prod(dims, dim=1)
+    
+    return iou - (enclosing_vol - union)/enclosing_vol
 
 
 def sinusoidal_time_embedding(boxes:torch.Tensor) -> torch.Tensor:
@@ -22,21 +84,20 @@ def sinusoidal_time_embedding(boxes:torch.Tensor) -> torch.Tensor:
     Returns:
         Tensor with sinusoidal time embeddings added to the input.
     """
-
-
     _, T, _, D = boxes.shape 
     assert D % 2 == 0, "Feature dimension must be even for sinusoidal embeddings."
 
-    # Create time positions [0, 1, ..., T-1]
-    position = torch.arange(T).unsqueeze(1).to(boxes)  # (T, 1)
+    # Create time positions [0, 1, ..., T]
+    position = torch.arange(T+1).unsqueeze(1).to(boxes)  # (T + 1, 1)
     div_term = torch.exp(torch.arange(0, D, 2).to(boxes) * (-math.log(10000.0) / D))  # (D/2,)
 
-    pe = torch.zeros(T, D).to(boxes)  # (T, D)
+    pe = torch.zeros(T + 1, D).to(boxes)  # (T + 1, D)
     pe[:, 0::2] = torch.sin(position * div_term)
     pe[:, 1::2] = torch.cos(position * div_term)
 
-    # Expand to match input shape: (1, T, 1, D):
+    # Expand to match input shape: (1, T + 1, 1, D):
     pe = pe.unsqueeze(0).unsqueeze(2)
+    
     return pe
 
 
@@ -112,7 +173,7 @@ def sinusoidal_time_embedding(boxes:torch.Tensor) -> torch.Tensor:
 
 class TemporalBoxDecoder(nn.Module):
 
-    def __init__(self, box_dim, feature_dim, n_heads, n_layers, n_embeddings) -> None:
+    def __init__(self, box_dim, feature_dim, n_heads, n_layers, n_embeddings, n_classes) -> None:
         super().__init__()
         
 
@@ -123,16 +184,21 @@ class TemporalBoxDecoder(nn.Module):
         
         self.decoder = nn.TransformerDecoder(nn.TransformerDecoderLayer(d_model=feature_dim, nhead=n_heads, dim_feedforward=feature_dim, batch_first=True), num_layers=n_layers)
         self.queries = nn.Embedding(n_embeddings, feature_dim)
+        self.class_embedding = nn.Embedding(n_classes, feature_dim)
         self.feature_to_box = nn.Linear(in_features=feature_dim, out_features=box_dim)
+        self.box_score = nn.Linear(in_features=box_dim, out_features=1)
+        self.classifier = nn.Linear(in_features=feature_dim, out_features=n_classes)
 
         self.box_dim = box_dim
         self.feature_dim = feature_dim
         self.n_heads = n_heads
         self.n_layers = n_layers
+        self.n_queries = n_embeddings
 
-    def forward(self, boxes:torch.Tensor):
+
+    def forward(self, boxes:torch.Tensor, valid_box_mask:torch.Tensor, labels:torch.Tensor):
         """
-        Given boxes from previous timesteps, this model is to learn a transformation for the box.
+        Given pure boxes from previous timesteps, this model is to learn a transformation for the box.
         Each box from t_a to T are treated independently (there is no temporal relation between boxes)
         The prediction happens from t_a to T.
 
@@ -141,24 +207,29 @@ class TemporalBoxDecoder(nn.Module):
         """
         # boxes -> (batch_size, num_timesteps, num_boxes, box_dim)
         batch_size, num_timesteps, num_boxes, box_dim  = boxes.shape
+        box_feats = torch.zeros((batch_size * num_timesteps * num_boxes, self.feature_dim)).to(boxes)
+
         boxes = rearrange(boxes, 'b t n f -> (b t n) f')
 
-        padding_mask = (boxes.abs().sum(dim=-1) == 0).reshape(batch_size, -1)
-        box_feats = self.box_to_feature(boxes)
-        box_feats = box_feats.reshape((batch_size, num_timesteps, num_boxes, self.feature_dim))
+        key_padding_mask = rearrange(~valid_box_mask, 'b t n -> b (t n)')
 
-        box_feats += sinusoidal_time_embedding(boxes)
+        box_feats[valid_box_mask.flatten()] = self.box_to_feature(boxes[valid_box_mask.flatten()]) + self.class_embedding(labels[valid_box_mask])
+        box_feats = box_feats.reshape((batch_size, num_timesteps, num_boxes, self.feature_dim))
+        
+        te = sinusoidal_time_embedding(box_feats)
+
+        curr_te, prev_te = te[:, 0, ...], te[:, 1:, ...]
+        box_feats += prev_te
 
         box_feats = rearrange(box_feats, 'b t n f -> b (t n) f')
-        queries = self.queries.weight.unsqueeze(0).expand(batch_size, -1, -1)
+        queries = self.queries.weight.unsqueeze(0).expand(batch_size, -1, -1) + curr_te
 
-        query_feats = self.decoder(tgt=queries, memory=box_feats, memory_key_padding_mask=padding_mask)
-        
+        query_feats = self.decoder(tgt=queries, memory=box_feats, memory_key_padding_mask=key_padding_mask)
         pred_boxes = self.feature_to_box(query_feats)
-        return pred_boxes
+        class_scores = self.classifier(query_feats)
+        box_scores = self.box_score(pred_boxes)
 
-
-
+        return pred_boxes, box_scores, class_scores
 
 
 class TransFusion(Detector3DTemplate):
@@ -395,7 +466,7 @@ class TransfusionWrapper(nn.Module):
             return pred_dicts, recall_dicts
         
 
-class TransFusionTemporalModel(TransFusion):    
+class TransFusionTemporalFullSweepBoxModel(TransFusion):    
     
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -404,77 +475,272 @@ class TransFusionTemporalModel(TransFusion):
             for param in module.parameters():
                 param.requires_grad = False
         
-        
+        self.num_classes = kwargs.get('num_classes', 10)
+
         self.temporal_box_model = TemporalBoxDecoder(
                 box_dim = kwargs.get('box_dim', 10),
-                feature_dim = kwargs.get('box_decoder_feature_dim', 32),
-                n_heads = kwargs.get('n_box_decoder_heads', 2),
+                feature_dim = kwargs.get('box_decoder_feature_dim', 256),
+                n_heads = kwargs.get('n_box_decoder_heads', 8),
                 n_layers = kwargs.get('n_box_decoder_layers', 6),
-                n_embeddings = kwargs.get('n_box_decoder_embeds', 200)
+                n_embeddings = kwargs.get('n_box_decoder_embeds', 200),
+                n_classes = kwargs.get('num_classes', 10)
             )
 
+        self.pcd_range = self.vfe.point_cloud_range
+        self.box_code_length = 10
+
+        default_assigner = {
+                "cls_cost": {"weight": 0.0,},
+                "reg_cost": {"weight": 1.0,},
+                "iou_cost": {"weight": 1.0,},
+                }
         
-    def process_boxes(self, box_dicts):
+        self.reg_loss_weight = kwargs.get('reg_loss_weight', 1.0)
+        self.score_loss_weight = kwargs.get('reg_loss_weight', 0.5)
+        self.cls_loss_weight = kwargs.get('class_loss_weight', 1.0)
+
+        self.cls_loss = SigmoidFocalClassificationLoss()
+
+        self.bbox_assigner = HungarianAssigner3D(**kwargs.get('assigner', default_assigner))
+        self.init_weights()
+
+
+    def init_weights(self):
+
+        for module in self.temporal_box_model.modules():
+
+            if isinstance(module, nn.Linear):
+                nn.init.kaiming_normal_(module.weight)
+                nn.init.zeros_(module.bias)
+
+            elif isinstance(module, nn.Embedding):
+                nn.init.kaiming_uniform_(module.weight)
+
+        
+    def process_boxes(self, box_dict, keys, use_score = False):
         
         num_boxes = []
-        batch_size = len(box_dicts)
-                
-        for idx, box_dict in enumerate(box_dicts):
+        batch_size, _, box_dim = box_dict[keys[0]].shape
+        num_timesteps = len(keys)
+        # for idx, box_dict in enumerate(box_dicts):
             
-            scores = box_dict['pred_scores']
-            thresh_mask = scores > 0.5 * max(scores)
-            num_boxes.append(thresh_mask.sum().item())
+        #     scores = box_dict['pred_scores']
+        #     thresh_mask = scores > 0.5 * max(scores)
+        #     num_boxes.append(thresh_mask.sum().item())
             
-            box_dicts[idx]['pred_scores'] = box_dict['pred_scores'][thresh_mask]
-            box_dicts[idx]['pred_boxes'] = box_dict['pred_boxes'][thresh_mask]
-            box_dicts[idx]['pred_labels'] = box_dict['pred_labels'][thresh_mask]
+        #     box_dicts[idx]['pred_scores'] = box_dict['pred_scores'][thresh_mask]
+        #     box_dicts[idx]['pred_boxes'] = box_dict['pred_boxes'][thresh_mask]
+        #     box_dicts[idx]['pred_labels'] = box_dict['pred_labels'][thresh_mask]
         
-        num_max_boxes = max(num_boxes)
-        processed_boxes = torch.zeros((batch_size, num_max_boxes, 10)).to(box_dicts[0]['pred_boxes'])
+        # num_max_boxes = max(num_boxes)
+        # processed_boxes = torch.zeros((batch_size, num_max_boxes, 10)).to(box_dicts[0]['pred_boxes'])
         
-        for idx, curr_num_boxes in enumerate(num_boxes):
-            processed_boxes[idx][:curr_num_boxes] = torch.cat([box_dicts[idx]['pred_boxes'], box_dicts[idx]['pred_labels'][:, None]], dim=1)
+        # for idx, curr_num_boxes in enumerate(num_boxes):
+        #     processed_boxes[idx][:curr_num_boxes] = torch.cat([box_dicts[idx]['pred_boxes'], box_dicts[idx]['pred_labels'][:, None]], dim=1)
         
-        return processed_boxes
-    
 
-    def train_box_decoder(self, batch_dict):
+        for idx, key in enumerate(keys):
+
+            boxes = box_dict[key]
+            num_boxes.append(boxes.shape[1])
+
+        total_boxes = max(num_boxes)
+        processed_boxes = torch.zeros((batch_size, num_timesteps, total_boxes, box_dim)).to(box_dict[keys[0]])
         
-        prev_boxes = batch_dict['prev_gt_boxes']
+        for idx, key in enumerate(keys):
+            
+            boxes_taken = num_boxes[idx]
+            processed_boxes[:, idx, :boxes_taken, :] = box_dict[key]
+
+        return processed_boxes
+
     
+    def predict(self, boxes: torch.Tensor):
+        
+        B, T, N, D = boxes.shape
+        
+        valid_box_mask = boxes.sum(dim=-1) != 0
+        encoded_boxes = boxes.new_zeros((B, T, N, self.box_code_length))
+        labels = torch.zeros((B, T, N), dtype=torch.long, device=boxes.device)
+        labels[valid_box_mask] = boxes[valid_box_mask][:, -1].long() - 1
+        encoded_boxes[valid_box_mask] = encode_bbox(boxes[valid_box_mask], self.pcd_range)
+        
+        return self.temporal_box_model(encoded_boxes, valid_box_mask, labels)
+
+    
+    def train_box_decoder(self, boxes: torch.Tensor, gt_boxes: torch.Tensor):
+
+        """
+
+        boxes: boxes from previous timesteps
+        gt_boxes: GT boxes at current timesteps
+
+        NOTE: We need decoded boxes for Hungarian Matching and encoded box for loss computation
+        
+        For matching -> eg. pred-> (200, 9), gt-> (29, 9)
+
+        get_targets_single : line 308
+        
+        NOTE: After Hungarian Assignment, only positive boxes have a regression loss.
+        """
+        gt_box_tensor, gt_box_labels = gt_boxes[...,:-1], gt_boxes[...,-1]
+        gt_box_labels = gt_box_labels.long() - 1
+        
+        pred_boxes, box_scores, class_scores = self.predict(boxes) # class_scores -> (batch, 200, 10)      
+        batch_size, num_preds, box_dim = pred_boxes.shape
+
+        decoded_pred_boxes = decode_bbox(pred_boxes, self.pcd_range)
+        
+        valid_gt_mask = gt_boxes.sum(dim=-1) != 0
+        total_boxes = valid_gt_mask.sum()
+        
+        target_boxes = gt_box_tensor.new_zeros((batch_size, num_preds, box_dim))
+        target_box_weights = torch.zeros_like(target_boxes)
+        target_scores = torch.zeros_like(box_scores)
+        
+        target_labels = gt_box_labels.new_zeros((batch_size, num_preds, self.num_classes))
+        label_weights = gt_box_labels.new_zeros((batch_size, num_preds))
+        # gIou3d = 0.0
+
+        for idx in range(batch_size):
+
+            valid_gt_tensor = gt_box_tensor[idx][valid_gt_mask[idx]]
+            valid_gt_labels = gt_box_labels[idx][valid_gt_mask[idx]]
+
+            assigned_gt_inds, ious = self.bbox_assigner.assign(
+                    decoded_pred_boxes.detach()[idx],
+                    valid_gt_tensor,
+                    valid_gt_labels,
+                    class_scores[idx : idx + 1].permute(0,2,1),
+                    self.pcd_range)
+    
+            pos_inds_locs = torch.nonzero(assigned_gt_inds, as_tuple=True)[0].unique()
+            pos_gt_inds = assigned_gt_inds[pos_inds_locs] - 1
+            
+            gt_box_ordered = valid_gt_tensor[pos_gt_inds]
+            target_boxes[idx, pos_inds_locs] = encode_bbox(gt_box_ordered, self.pcd_range)
+            target_box_weights[idx, pos_inds_locs] = 1.0
+            target_scores[idx, pos_inds_locs] = 1.0
+
+            target_labels[idx, pos_inds_locs] = F.one_hot(valid_gt_labels[pos_gt_inds], self.num_classes)
+            label_weights[idx, pos_inds_locs] = 1.0
+
+        # gIou3d += calculate_generalized_iou3d(decoded_pred_boxes[idx, :, :7], gt_box_ordered[:, :7])
+        loss_dict = dict()
+        reg_loss =  (F.l1_loss(pred_boxes, target_boxes, reduction='none') * target_box_weights).sum() / total_boxes 
+        loss_dict['reg_loss'] = reg_loss.item()
+        # loss_dict['GIoU3D_loss'] = 1.0 - gIou3d/batch_size
+
+        score_loss = focal_loss(box_scores, target_scores)
+        loss_dict['score_loss'] = score_loss.item()
+
+        cls_loss = self.cls_loss(class_scores, target_labels, label_weights).sum()/max(total_boxes, 1)
+        
+        loss_dict['cls_loss'] = cls_loss.item()
+        loss = reg_loss * self.reg_loss_weight + score_loss * self.score_loss_weight + self.cls_loss_weight * cls_loss
+        
+        return loss, loss_dict
+
+
     def forward(self, batch_dict):
         
-        prev_batch_dict = batch_dict.copy()
-        prev_batch_dict['points'] = batch_dict['prev_points']
-        
+        """
+        Check box shapes for all timesteps.
+        """
+
         gt_boxes = batch_dict['gt_boxes']
-        prev_batch_dict['prev_boxes'] = torch.empty((0, 0, 10)).to(gt_boxes)
-        
-        with torch.no_grad():        
-            for cur_module in self.module_list:
-                cur_module.training = False
-                prev_batch_dict = cur_module(prev_batch_dict)
-            
-            box_dicts = prev_batch_dict['final_box_dicts']
-            batch_dict['prev_boxes'] = self.process_boxes(box_dicts)
-        
-        for cur_module in self.module_list:
-            
-            if self.training:
-                cur_module.training = True
-                
-            batch_dict = cur_module(batch_dict)
-        
+        batch_size = batch_dict['batch_size']
+
+        prev_keys = [key for key in batch_dict.keys() if 'boxes_' in key]
+
         if self.training:
-            loss, tb_dict, disp_dict = self.get_training_loss(batch_dict)
+
+            prev_boxes_padded = self.process_boxes(batch_dict, prev_keys)
+            loss, loss_dict = self.train_box_decoder(prev_boxes_padded, gt_boxes)
 
             ret_dict = {
-                'loss': loss
+                "loss": loss
             }
-            return ret_dict, tb_dict, disp_dict
+
+            tb_dict = dict()
+
+            return ret_dict, tb_dict, loss_dict
+
         else:
-            pred_dicts, recall_dicts = self.post_processing(batch_dict)
-            return pred_dicts, recall_dicts
+            
+            no_prev_data_idxs = []
+            prev_data_present_idxs = []
+
+            recall_dict = dict()
+
+            for idx in range(batch_size):
+                if batch_dict['prev_data_present'][idx] is False:
+                    no_prev_data_idxs.append(idx)
+                else:
+                    prev_data_present_idxs.append(idx)
+
+            prev_boxes_padded = self.process_boxes(batch_dict, prev_keys)[prev_data_present_idxs]
+            pred_dicts = []
+
+            pred_boxes, box_scores, class_scores = self.predict(prev_boxes_padded)
+            decoded_boxes = decode_bbox(pred_boxes, self.pcd_range)
+            box_scores = box_scores.sigmoid()
+            class_labels = class_scores.max(dim=-1).indices
+
+            box_scores.sigmoid()
+            score_mask = box_scores > 0.2
+
+            for idx in range(batch_size):
+                
+                pred = dict()
+
+                if idx in prev_data_present_idxs:
+                    pred["pred_scores"] = box_scores[idx][score_mask[idx]]
+                    pred["pred_boxes"] = decoded_boxes[idx][score_mask[idx][:, 0]]
+                    pred["pred_labels"] = class_labels[idx][score_mask[idx][:, 0]]
+
+                    pred_dicts.append(pred)
+            
+                else:
+                    pred['pred_scores'] = gt_boxes.new_zeros(self.temporal_box_model.n_queries)
+                    pred['pred_boxes'] = gt_boxes.zeros((self.temporal_box_model.n_queries, 9))
+                    pred['pred_labels'] = torch.zeros(self.temporal_box_model.n_queries, dtype=torch.long, device = gt_boxes.device)
+                
+                    pred_dicts.append(pred)
+            
+            return pred_dicts, recall_dict
+        # prev_batch_dict = batch_dict.copy()
+        # prev_batch_dict['points'] = batch_dict['prev_points']
+        
+        # gt_boxes = batch_dict['gt_boxes']
+        # prev_batch_dict['prev_boxes'] = torch.empty((0, 0, 10)).to(gt_boxes)
+        
+        # with torch.no_grad():        
+        #     for cur_module in self.module_list:
+        #         cur_module.training = False
+        #         prev_batch_dict = cur_module(prev_batch_dict)
+            
+        #     box_dicts = prev_batch_dict['final_box_dicts']
+        #     batch_dict['prev_boxes'] = self.process_boxes(box_dicts)
+        
+        # for cur_module in self.module_list:
+            
+        #     if self.training:
+        #         cur_module.training = True
+                
+        #     batch_dict = cur_module(batch_dict)
+        
+        
+        # if self.training:
+        #     loss, tb_dict, disp_dict = self.get_training_loss(batch_dict)
+
+        #     ret_dict = {
+        #         'loss': loss
+        #     }
+        #     return ret_dict, tb_dict, disp_dict
+        # else:
+        #     pred_dicts, recall_dicts = self.post_processing(batch_dict)
+        #     return pred_dicts, recall_dicts
     
     
 # class TransfusionTemporalWrapper(nn.Module):
